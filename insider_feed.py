@@ -88,6 +88,18 @@ SENIOR_PAT = re.compile(
 )
 
 
+def _prev_business_day(d):
+    """d 직전의 평일. 주말 수동 실행 시 빈 인덱스를 조회하는 것을 막는다.
+
+    미 공휴일은 달력을 들고 있지 않아 걸러내지 못한다. 공휴일 다음 날
+    실행하면 해당일 인덱스가 없어 0건이 나오는데, 이는 오류가 아니다.
+    """
+    d -= dt.timedelta(days=1)
+    while d.weekday() >= 5:      # 5=토, 6=일
+        d -= dt.timedelta(days=1)
+    return d
+
+
 def form4_filings(date):
     """해당 날짜 daily-index에서 Form 4 제출 경로 목록."""
     q = (date.month - 1) // 3 + 1
@@ -373,16 +385,16 @@ def send(text):
     r.raise_for_status()
 
 
-def main():
-    # --- 내부자 ---
-    target = dt.date.today() - dt.timedelta(days=1)
+def run_insider():
+    target = _prev_business_day(dt.date.today())
     rows = collect_form4(target)
     annotate_cluster(rows)
     buys, sells = filter_buys(rows), filter_sells(rows)
-    print(f"form4 raw={len(rows)} buys={len(buys)} sells={len(sells)}")
+    print(f"form4 target={target} raw={len(rows)} buys={len(buys)} sells={len(sells)}")
     send(build_insider_message(buys, sells, target, len(rows)))
 
-    # --- 하원 PTR ---
+
+def run_congress():
     since = dt.date.today() - dt.timedelta(days=CONGRESS_LOOKBACK_DAYS)
     seen = load_seen()
     rows, scanned = house_ptr.collect_house(since)
@@ -394,6 +406,19 @@ def main():
         seen.update(r["key"] for r in fresh)
         seen.update(f["doc_id"] for f in scanned)
         save_seen(seen)
+
+
+def main():
+    """두 피드는 서로 독립이다. 한쪽이 실패해도 다른 쪽은 시도한다."""
+    failed = []
+    for name, fn in (("내부자", run_insider), ("하원", run_congress)):
+        try:
+            fn()
+        except Exception as e:
+            failed.append(name)
+            print(f"[error] {name} 피드 실패: {e!r}", file=sys.stderr)
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
