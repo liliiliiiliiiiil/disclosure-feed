@@ -115,7 +115,8 @@ def form4_filings(date):
         parts = line.split("|")
         if len(parts) == 5 and parts[2].strip() == "4":
             paths.append(parts[4].strip())
-    return paths
+    # 공동신고는 신고자 CIK마다 한 줄씩 나열되어 같은 파일이 중복 등장한다.
+    return sorted(set(paths))
 
 
 def _is_plan_trade(node):
@@ -161,8 +162,11 @@ def parse_form4(path):
     except ET.ParseError:
         return []
 
-    ticker = (doc.findtext("issuer/issuerTradingSymbol") or "").strip()
+    ticker = (doc.findtext("issuer/issuerTradingSymbol") or "").strip().upper()
     issuer = (doc.findtext("issuer/issuerName") or "").strip()
+    # 집합투자기구 등 상장 종목이 아닌 발행인은 심볼 자리에 N/A/NONE 을 넣는다.
+    if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,5}", ticker) or ticker in ("N/A", "NONE"):
+        return []
 
     # 공동신고 대응: reportingOwner가 복수일 수 있다.
     owners, titles = [], []
@@ -203,7 +207,8 @@ def parse_form4(path):
         if value <= 0:
             continue
         out.append({
-            "ticker": ticker or issuer[:12],
+            "ticker": ticker,
+            "src": path,
             "owners": tuple(owners),
             "title": title or (rank.title() if rank in ("DIRECTOR",) else ""),
             "rank": rank,
@@ -226,11 +231,16 @@ def collect_form4(date):
 
 
 def annotate_cluster(rows):
-    """동일 종목을 매수한 서로 다른 신고자 수를 각 행에 붙인다."""
+    """동일 종목을 매수한 '독립적인 신고 건수'를 각 행에 붙인다.
+
+    신고자 이름 수가 아니라 제출 파일 수를 센다. 계열 펀드 여러 곳이
+    한 장에 공동신고한 것은 하나의 판단이지 여러 사람의 합의가 아니므로,
+    이름으로 세면 가짜 클러스터가 만들어진다.
+    """
     by_ticker = {}
     for r in rows:
         if r["code"] == "P":
-            by_ticker.setdefault(r["ticker"], set()).update(r["owners"])
+            by_ticker.setdefault(r["ticker"], set()).add(r["src"])
     for r in rows:
         r["cluster"] = len(by_ticker.get(r["ticker"], ())) if r["code"] == "P" else 0
 
@@ -330,14 +340,14 @@ def build_insider_message(buys, sells, date, total):
     for r in buys:
         tag = f" 🔥x{r['cluster']}" if r["cluster"] >= CLUSTER_MIN else ""
         t = f" · {esc(r['title'])}" if r["title"] else ""
-        lines.append(f"<code>{esc(r['ticker']):<6}</code> {money(r['value'])}{tag} — {who_of(r)}{t}")
+        lines.append(f"<code>{esc(r['ticker'])}</code> {money(r['value'])}{tag} — {who_of(r)}{t}")
 
     lines += ["", f"<b>매도 (S)</b>  <i>10b5-1 제외 · ≥{money(MIN_SELL_VALUE)}</i>"]
     if not sells:
         lines.append("<i>없음</i>")
     for r in sells:
         t = f" · {esc(r['title'])}" if r["title"] else ""
-        lines.append(f"<code>{esc(r['ticker']):<6}</code> {money(r['value'])} — {who_of(r)}{t}")
+        lines.append(f"<code>{esc(r['ticker'])}</code> {money(r['value'])} — {who_of(r)}{t}")
 
     return clamp(lines)
 
