@@ -201,9 +201,10 @@ def parse_form4(path):
         if not shares or not price:
             continue
         try:
-            value = float(shares) * float(price)
+            sh, px = float(shares), float(price)
         except ValueError:
             continue
+        value = sh * px
         if value <= 0:
             continue
         out.append({
@@ -213,6 +214,7 @@ def parse_form4(path):
             "title": title or (rank.title() if rank in ("DIRECTOR",) else ""),
             "rank": rank,
             "code": code,
+            "shares": sh,
             "value": value,
             "plan": _is_plan_trade(t) or _is_plan_trade(doc),
             "date": t.findtext("transactionDate/value") or "",
@@ -228,6 +230,30 @@ def collect_form4(date):
         for chunk in ex.map(parse_form4, paths):
             rows.extend(chunk)
     return rows
+
+
+def aggregate(rows):
+    """같은 신고서 내 동일 종목·동일 코드의 분할 체결을 한 건으로 합친다.
+
+    하루치를 여러 가격대로 나눠 체결하면 tranche 마다 행이 생기는데,
+    이를 개별 거래로 두면 상위 목록을 한 사람이 잠식하고 각 조각이
+    금액 하한에 걸려 전량 탈락하는 일이 생긴다. 단가는 가중평균을 쓴다.
+    """
+    merged = {}
+    for r in rows:
+        k = (r["src"], r["ticker"], r["code"])
+        m = merged.get(k)
+        if m is None:
+            merged[k] = dict(r)
+            continue
+        m["shares"] += r["shares"]
+        m["value"] += r["value"]
+        m["plan"] = m["plan"] or r["plan"]
+        if r["date"] < m["date"]:
+            m["date"] = r["date"]
+    for m in merged.values():
+        m["price"] = m["value"] / m["shares"] if m["shares"] else 0.0
+    return list(merged.values())
 
 
 def annotate_cluster(rows):
@@ -304,6 +330,15 @@ def esc(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def tv(ticker):
+    """트레이딩뷰 심볼 페이지. 거래소 접두어 없이도 해석된다."""
+    return f'<a href="https://www.tradingview.com/symbols/{esc(ticker)}/">{esc(ticker)}</a>'
+
+
+def price(v):
+    return f"${v:,.2f}" if v < 1000 else f"${v:,.0f}"
+
+
 def money(v):
     if v >= 1e6:
         return f"${v/1e6:.1f}M"
@@ -340,14 +375,14 @@ def build_insider_message(buys, sells, date, total):
     for r in buys:
         tag = f" 🔥x{r['cluster']}" if r["cluster"] >= CLUSTER_MIN else ""
         t = f" · {esc(r['title'])}" if r["title"] else ""
-        lines.append(f"<code>{esc(r['ticker'])}</code> {money(r['value'])}{tag} — {who_of(r)}{t}")
+        lines.append(f"{tv(r['ticker'])} {money(r['value'])} @ {price(r['price'])}{tag} — {who_of(r)}{t}")
 
     lines += ["", f"<b>매도 (S)</b>  <i>10b5-1 제외 · ≥{money(MIN_SELL_VALUE)}</i>"]
     if not sells:
         lines.append("<i>없음</i>")
     for r in sells:
         t = f" · {esc(r['title'])}" if r["title"] else ""
-        lines.append(f"<code>{esc(r['ticker'])}</code> {money(r['value'])} — {who_of(r)}{t}")
+        lines.append(f"{tv(r['ticker'])} {money(r['value'])} @ {price(r['price'])} — {who_of(r)}{t}")
 
     return clamp(lines)
 
@@ -367,8 +402,9 @@ def build_congress_message(rows, scanned, since):
             lines.append("<i>없음</i>")
         for r in group:
             lines.append(
-                f'<a href="{r["link"]}">{esc(r["ticker"])}</a> {esc(r["amount"])} — '
-                f'{esc(r["who"])} <i>({esc(r["district"])}, 거래 {esc(r["traded"])})</i>'
+                f'{tv(r["ticker"])} {esc(r["amount"])} — {esc(r["who"])} '
+                f'<i>({esc(r["district"])}, 거래 {esc(r["traded"])})</i> '
+                f'<a href="{r["link"]}">PTR</a>'
             )
         lines.append("")
 
@@ -397,7 +433,7 @@ def send(text):
 
 def run_insider():
     target = _prev_business_day(dt.date.today())
-    rows = collect_form4(target)
+    rows = aggregate(collect_form4(target))
     annotate_cluster(rows)
     buys, sells = filter_buys(rows), filter_sells(rows)
     print(f"form4 target={target} raw={len(rows)} buys={len(buys)} sells={len(sells)}")
