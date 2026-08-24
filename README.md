@@ -1,7 +1,5 @@
 # disclosure-feed
 
-# disclosure-feed
-
 A scheduled job that reads U.S. statutory financial disclosures and pushes a
 filtered digest to Telegram. Two independent feeds, sent as separate messages
 because the underlying filings have very different reporting lag and precision.
