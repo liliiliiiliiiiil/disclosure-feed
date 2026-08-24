@@ -110,13 +110,21 @@ def form4_filings(date):
     except requests.HTTPError:
         return []  # 주말/공휴일
 
-    paths = []
+    # 공동신고는 신고자 CIK 마다 한 줄씩 나열되고, Filename 의 디렉터리가
+    # 그 CIK 라 경로 문자열이 서로 다르다. 같은 문서인지는 경로 끝의
+    # 접수번호(제출당 전역 고유)로만 판별할 수 있다.
+    seen, paths = set(), []
     for line in text.splitlines():
         parts = line.split("|")
-        if len(parts) == 5 and parts[2].strip() == "4":
-            paths.append(parts[4].strip())
-    # 공동신고는 신고자 CIK마다 한 줄씩 나열되어 같은 파일이 중복 등장한다.
-    return sorted(set(paths))
+        if len(parts) != 5 or parts[2].strip() != "4":
+            continue
+        p = parts[4].strip()
+        acc = p.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        if acc in seen:
+            continue
+        seen.add(acc)
+        paths.append(p)
+    return paths
 
 
 def _is_plan_trade(node):
@@ -209,7 +217,7 @@ def parse_form4(path):
             continue
         out.append({
             "ticker": ticker,
-            "src": path,
+            "src": path.rsplit("/", 1)[-1].rsplit(".", 1)[0],
             "owners": tuple(owners),
             "title": title or (rank.title() if rank in ("DIRECTOR",) else ""),
             "rank": rank,
