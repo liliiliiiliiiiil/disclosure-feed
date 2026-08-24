@@ -1,0 +1,15 @@
+# Runtime state (managed by actions/cache, must not be committed)
+.state/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local secrets — never commit
+.env
+
+# OS
+.DS_Store
+Thumbs.db
