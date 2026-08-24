@@ -127,19 +127,28 @@ def form4_filings(date):
     return paths
 
 
-def _is_plan_trade(node):
+PLAN_FOOTNOTE_RE = re.compile(r"10b5\s*-?\s*1\b", re.I)
+
+
+def _is_plan_trade(doc):
     """10b5-1 사전약정 매매 여부.
 
-    2022년 12월 개정으로 Form 4에 명시 플래그가 생겼으나 스키마 버전에
-    따라 태그명이 달라 방어적으로 탐색한다. 플래그가 없는 구형 제출은
-    False로 떨어지며, 이 경우 판별 불가라는 뜻이지 사전약정이 아니라는
-    뜻은 아니다.
+    실측 기준 태그는 <aff10b5One>1</aff10b5One> 이며 문서 단위 체크박스다.
+    숫자 1 이 영단어 One 으로 표기되어 있어 '10b51' 로는 매칭되지 않는다.
+
+    체크박스는 2022년 12월 규칙 개정으로 신설되어 그 이전 신고서에는 없다.
+    구형 건은 각주 본문의 10b5-1 언급으로 보완한다. 한 신고서에 계획매매와
+    재량매매가 섞인 경우 전부 계획매매로 간주하는데, 애매한 건을 흘려보내는
+    것보다 버리는 쪽이 신호 품질에 유리하다.
     """
-    for el in node.iter():
-        tag = el.tag.lower().replace("-", "").replace("_", "")
-        if "10b51" in tag:
+    for el in doc.iter():
+        if "10b5" in el.tag.lower().replace("-", "").replace("_", ""):
             v = (el.findtext("value") or el.text or "").strip().lower()
-            return v in ("1", "true")
+            if v in ("1", "true"):
+                return True
+    for fn in doc.iter("footnote"):
+        if fn.text and PLAN_FOOTNOTE_RE.search(fn.text):
+            return True
     return False
 
 
@@ -198,6 +207,7 @@ def parse_form4(path):
 
     title = max(titles, key=len) if titles else ""
     rank = _rank(title, is_director, is_ten_pct)
+    is_plan = _is_plan_trade(doc)   # 문서 단위 체크박스이므로 한 번만 본다
 
     out = []
     for t in doc.findall("nonDerivativeTable/nonDerivativeTransaction"):
@@ -224,7 +234,7 @@ def parse_form4(path):
             "code": code,
             "shares": sh,
             "value": value,
-            "plan": _is_plan_trade(t) or _is_plan_trade(doc),
+            "plan": is_plan,
             "date": t.findtext("transactionDate/value") or "",
         })
     return out
