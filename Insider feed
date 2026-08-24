@@ -1,0 +1,400 @@
+"""SEC Form 4 내부자 거래 + 미 의회 PTR 피드.
+
+두 소스는 신고지연(2영업일 vs 45일)과 금액 정밀도(실액 vs 구간)가 달라
+서로 다른 필터를 적용하고 별도 메시지로 전송한다.
+
+하원 PTR 수집은 house_ptr 모듈 참조 (Clerk 공식 소스 직접 파싱).
+상원(efdsearch)은 접속 동의 절차가 필요해 아직 미포함.
+
+환경변수:
+  SEC_UA           SEC 필수 User-Agent. 예: "Yunchan Kim yunchan@example.com"
+  TELEGRAM_TOKEN
+  TELEGRAM_CHAT_ID
+  STATE_PATH       (선택) 의회 공시 중복 발송 방지용. 기본 .state/seen.json
+"""
+import json
+import os
+import re
+import sys
+import threading
+import time
+import datetime as dt
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+
+import requests
+
+import house_ptr
+
+SEC_UA = os.environ["SEC_UA"]
+TG_TOKEN = os.environ["TELEGRAM_TOKEN"]
+TG_CHAT = os.environ["TELEGRAM_CHAT_ID"]
+STATE_PATH = os.environ.get("STATE_PATH", ".state/seen.json")
+
+# --- 내부자(Form 4) 필터 ---
+MIN_BUY_VALUE = 100_000       # 생색내기 매수 컷
+BIG_BUY_VALUE = 1_000_000     # 직급 무관 통과
+MIN_SELL_VALUE = 5_000_000    # 매도는 신호가 약해 문턱을 높인다
+CLUSTER_MIN = 3               # 동일 종목 서로 다른 신고자 수
+TOP_N = 12
+
+# --- 의회 PTR 필터 ---
+CONGRESS_LOOKBACK_DAYS = 7
+CONGRESS_MIN_AMOUNT = 50_000  # 구간 상단 기준
+
+SEC_WORKERS = 6
+SEC_RATE = 8.0                # req/sec 상한 (SEC 공식 한도 10)
+
+
+# ---------- HTTP ----------
+
+_rate_lock = threading.Lock()
+_next_slot = [0.0]
+_local = threading.local()
+
+
+def _throttle():
+    with _rate_lock:
+        now = time.monotonic()
+        wait = _next_slot[0] - now
+        if wait > 0:
+            time.sleep(wait)
+            now = _next_slot[0]
+        _next_slot[0] = now + 1.0 / SEC_RATE
+
+
+def _session():
+    s = getattr(_local, "s", None)
+    if s is None:
+        s = requests.Session()
+        s.headers["User-Agent"] = SEC_UA
+        _local.s = s
+    return s
+
+
+def _get(url):
+    _throttle()
+    r = _session().get(url, timeout=30)
+    r.raise_for_status()
+    return r
+
+
+# ---------- SEC Form 4 ----------
+
+SENIOR_PAT = re.compile(
+    r"chief exec|\bceo\b|chief financ|\bcfo\b|chief oper|\bcoo\b|"
+    r"\bpresident\b|chairman|chair of the board",
+    re.I,
+)
+
+
+def form4_filings(date):
+    """해당 날짜 daily-index에서 Form 4 제출 경로 목록."""
+    q = (date.month - 1) // 3 + 1
+    url = (f"https://www.sec.gov/Archives/edgar/daily-index/"
+           f"{date.year}/QTR{q}/master.{date:%Y%m%d}.idx")
+    try:
+        text = _get(url).text
+    except requests.HTTPError:
+        return []  # 주말/공휴일
+
+    paths = []
+    for line in text.splitlines():
+        parts = line.split("|")
+        if len(parts) == 5 and parts[2].strip() == "4":
+            paths.append(parts[4].strip())
+    return paths
+
+
+def _is_plan_trade(node):
+    """10b5-1 사전약정 매매 여부.
+
+    2022년 12월 개정으로 Form 4에 명시 플래그가 생겼으나 스키마 버전에
+    따라 태그명이 달라 방어적으로 탐색한다. 플래그가 없는 구형 제출은
+    False로 떨어지며, 이 경우 판별 불가라는 뜻이지 사전약정이 아니라는
+    뜻은 아니다.
+    """
+    for el in node.iter():
+        tag = el.tag.lower().replace("-", "").replace("_", "")
+        if "10b51" in tag:
+            v = (el.findtext("value") or el.text or "").strip().lower()
+            return v in ("1", "true")
+    return False
+
+
+def _rank(title, is_director, is_ten_pct):
+    if title and SENIOR_PAT.search(title):
+        return "SENIOR"
+    if title:
+        return "OFFICER"
+    if is_ten_pct:
+        return "10%"
+    if is_director:
+        return "DIRECTOR"
+    return ""
+
+
+def parse_form4(path):
+    """제출 파일 하나에서 P/S 거래를 추출."""
+    try:
+        raw = _get(f"https://www.sec.gov/Archives/{path}").text
+    except requests.HTTPError:
+        return []
+
+    m = re.search(r"<ownershipDocument>.*?</ownershipDocument>", raw, re.S)
+    if not m:
+        return []
+    try:
+        doc = ET.fromstring(m.group(0))
+    except ET.ParseError:
+        return []
+
+    ticker = (doc.findtext("issuer/issuerTradingSymbol") or "").strip()
+    issuer = (doc.findtext("issuer/issuerName") or "").strip()
+
+    # 공동신고 대응: reportingOwner가 복수일 수 있다.
+    owners, titles = [], []
+    is_director = is_ten_pct = False
+    for ro in doc.findall("reportingOwner"):
+        name = (ro.findtext("reportingOwnerId/rptOwnerName") or "").strip()
+        if name:
+            owners.append(name)
+        rel = ro.find("reportingOwnerRelationship")
+        if rel is None:
+            continue
+        t = (rel.findtext("officerTitle") or "").strip()
+        if t:
+            titles.append(t)
+        if rel.findtext("isDirector") in ("1", "true"):
+            is_director = True
+        if rel.findtext("isTenPercentOwner") in ("1", "true"):
+            is_ten_pct = True
+    if not owners:
+        return []
+
+    title = max(titles, key=len) if titles else ""
+    rank = _rank(title, is_director, is_ten_pct)
+
+    out = []
+    for t in doc.findall("nonDerivativeTable/nonDerivativeTransaction"):
+        code = t.findtext("transactionCoding/transactionCode")
+        if code not in ("P", "S"):
+            continue
+        shares = t.findtext("transactionAmounts/transactionShares/value")
+        price = t.findtext("transactionAmounts/transactionPricePerShare/value")
+        if not shares or not price:
+            continue
+        try:
+            value = float(shares) * float(price)
+        except ValueError:
+            continue
+        if value <= 0:
+            continue
+        out.append({
+            "ticker": ticker or issuer[:12],
+            "owners": tuple(owners),
+            "title": title or (rank.title() if rank in ("DIRECTOR",) else ""),
+            "rank": rank,
+            "code": code,
+            "value": value,
+            "plan": _is_plan_trade(t) or _is_plan_trade(doc),
+            "date": t.findtext("transactionDate/value") or "",
+        })
+    return out
+
+
+def collect_form4(date):
+    paths = form4_filings(date)
+    print(f"[info] Form 4 제출 {len(paths)}건 수집 시작", file=sys.stderr)
+    rows = []
+    with ThreadPoolExecutor(max_workers=SEC_WORKERS) as ex:
+        for chunk in ex.map(parse_form4, paths):
+            rows.extend(chunk)
+    return rows
+
+
+def annotate_cluster(rows):
+    """동일 종목을 매수한 서로 다른 신고자 수를 각 행에 붙인다."""
+    by_ticker = {}
+    for r in rows:
+        if r["code"] == "P":
+            by_ticker.setdefault(r["ticker"], set()).update(r["owners"])
+    for r in rows:
+        r["cluster"] = len(by_ticker.get(r["ticker"], ())) if r["code"] == "P" else 0
+
+
+def filter_buys(rows):
+    """실전 필터: P + 사전약정 제외 + 금액 하한, 그 뒤 셋 중 하나 충족.
+
+    - 임원 상위직(CEO/CFO/COO/President/Chairman)
+    - 클러스터 매수 (서로 다른 신고자 CLUSTER_MIN명 이상)
+    - 단건 대형 매수
+    """
+    out = [
+        r for r in rows
+        if r["code"] == "P"
+        and not r["plan"]
+        and r["value"] >= MIN_BUY_VALUE
+        and (r["rank"] == "SENIOR"
+             or r["cluster"] >= CLUSTER_MIN
+             or r["value"] >= BIG_BUY_VALUE)
+    ]
+    out.sort(key=lambda r: (r["cluster"] >= CLUSTER_MIN, r["value"]), reverse=True)
+    return out[:TOP_N]
+
+
+def filter_sells(rows):
+    out = [
+        r for r in rows
+        if r["code"] == "S" and not r["plan"] and r["value"] >= MIN_SELL_VALUE
+    ]
+    out.sort(key=lambda r: -r["value"])
+    return out[:TOP_N // 2]
+
+
+# ---------- 의회 PTR ----------
+
+def filter_congress(rows):
+    return [r for r in rows if r["value"] >= CONGRESS_MIN_AMOUNT]
+
+
+# ---------- 중복 발송 방지 ----------
+
+def load_seen():
+    try:
+        with open(STATE_PATH) as f:
+            return set(json.load(f))
+    except (OSError, ValueError):
+        return set()
+
+
+def save_seen(seen):
+    d = os.path.dirname(STATE_PATH)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(STATE_PATH, "w") as f:
+        json.dump(sorted(seen)[-50_000:], f)  # 무한 증가 방지
+
+
+# ---------- 출력 ----------
+
+def esc(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def money(v):
+    if v >= 1e6:
+        return f"${v/1e6:.1f}M"
+    return f"${v/1e3:.0f}K"
+
+
+def who_of(r):
+    n = esc(r["owners"][0])
+    if len(r["owners"]) > 1:
+        n += f" 외 {len(r['owners']) - 1}"
+    return n
+
+
+def clamp(lines, limit=3900):
+    out, n = [], 0
+    for ln in lines:
+        if n + len(ln) + 1 > limit:
+            out.append("…")
+            break
+        out.append(ln)
+        n += len(ln) + 1
+    return "\n".join(out)
+
+
+def build_insider_message(buys, sells, date, total):
+    lines = [
+        f"<b>🏢 내부자 거래 · Form 4</b> — {date:%Y-%m-%d}",
+        f"<i>신고지연 2영업일 · 원시 {total}건 중 필터 통과분</i>",
+        "",
+        f"<b>매수 (P)</b>  <i>10b5-1 제외 · ≥{money(MIN_BUY_VALUE)}</i>",
+    ]
+    if not buys:
+        lines.append("<i>없음</i>")
+    for r in buys:
+        tag = f" 🔥x{r['cluster']}" if r["cluster"] >= CLUSTER_MIN else ""
+        t = f" · {esc(r['title'])}" if r["title"] else ""
+        lines.append(f"<code>{esc(r['ticker']):<6}</code> {money(r['value'])}{tag} — {who_of(r)}{t}")
+
+    lines += ["", f"<b>매도 (S)</b>  <i>10b5-1 제외 · ≥{money(MIN_SELL_VALUE)}</i>"]
+    if not sells:
+        lines.append("<i>없음</i>")
+    for r in sells:
+        t = f" · {esc(r['title'])}" if r["title"] else ""
+        lines.append(f"<code>{esc(r['ticker']):<6}</code> {money(r['value'])} — {who_of(r)}{t}")
+
+    return clamp(lines)
+
+
+def build_congress_message(rows, scanned, since):
+    buys = sorted([r for r in rows if r["type"] == "purchase"], key=lambda r: -r["value"])
+    sells = sorted([r for r in rows if r["type"] == "sale"], key=lambda r: -r["value"])
+
+    lines = [
+        f"<b>🏛 하원 PTR</b> — {since:%m/%d} 이후 신규 제출",
+        "<i>신고지연 최대 45일 · 금액은 구간 공시(상단 기준 정렬)</i>",
+        "",
+    ]
+    for label, group in (("매수", buys[:TOP_N]), ("매도", sells[:TOP_N // 2])):
+        lines.append(f"<b>{label}</b>")
+        if not group:
+            lines.append("<i>없음</i>")
+        for r in group:
+            lines.append(
+                f'<a href="{r["link"]}">{esc(r["ticker"])}</a> {esc(r["amount"])} — '
+                f'{esc(r["who"])} <i>({esc(r["district"])}, 거래 {esc(r["traded"])})</i>'
+            )
+        lines.append("")
+
+    if scanned:
+        lines.append(f"<b>⚠️ 스캔 제출본 {len(scanned)}건</b> <i>(자동 파싱 불가)</i>")
+        for f in scanned[:5]:
+            lines.append(f'· <a href="{f["url"]}">{esc(f["who"])}</a> {f["filed"]:%m/%d}')
+    return clamp(lines)
+
+
+def send(text):
+    r = requests.post(
+        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+        json={
+            "chat_id": TG_CHAT,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=30,
+    )
+    if not r.ok:
+        print(f"[error] telegram {r.status_code}: {r.text}", file=sys.stderr)
+    r.raise_for_status()
+
+
+def main():
+    # --- 내부자 ---
+    target = dt.date.today() - dt.timedelta(days=1)
+    rows = collect_form4(target)
+    annotate_cluster(rows)
+    buys, sells = filter_buys(rows), filter_sells(rows)
+    print(f"form4 raw={len(rows)} buys={len(buys)} sells={len(sells)}")
+    send(build_insider_message(buys, sells, target, len(rows)))
+
+    # --- 하원 PTR ---
+    since = dt.date.today() - dt.timedelta(days=CONGRESS_LOOKBACK_DAYS)
+    seen = load_seen()
+    rows, scanned = house_ptr.collect_house(since)
+    fresh = [r for r in filter_congress(rows) if r["key"] not in seen]
+    scanned = [f for f in scanned if f["doc_id"] not in seen]
+    print(f"congress new={len(fresh)} scanned={len(scanned)}")
+    if fresh or scanned:
+        send(build_congress_message(fresh, scanned, since))
+        seen.update(r["key"] for r in fresh)
+        seen.update(f["doc_id"] for f in scanned)
+        save_seen(seen)
+
+
+if __name__ == "__main__":
+    main()
