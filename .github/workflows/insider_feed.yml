@@ -1,0 +1,32 @@
+name: insider-feed
+
+on:
+  schedule:
+    # 05:30 UTC = 미 동부 01:30 (Form 4 마감 22:00 ET 이후, 인덱스 생성 완료)
+    - cron: "30 5 * * 2-6"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests pdfplumber
+
+      # 의회 공시 중복 발송 방지용 상태. 키에 run_id를 넣어 매번 새로 저장하고,
+      # restore-keys 로 직전 실행분을 복원한다.
+      - uses: actions/cache@v4
+        with:
+          path: .state
+          key: insider-feed-state-${{ github.run_id }}
+          restore-keys: insider-feed-state-
+
+      - run: python insider_feed.py
+        env:
+          SEC_UA: ${{ secrets.SEC_UA }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
