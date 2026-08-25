@@ -130,6 +130,14 @@ def form4_filings(date):
 PLAN_FOOTNOTE_RE = re.compile(r"10b5\s*-?\s*1\b", re.I)
 
 
+NON_COMMON_RE = re.compile(
+    r"preferred|warrant|\boption\b|\bright[s]?\b|debenture|\bbond\b|"
+    r"convertible note|restricted stock unit|\brsu\b|performance (share|stock|unit)|"
+    r"partnership interest|membership interest|\bdeferred\b|phantom",
+    re.I,
+)
+
+
 def _is_plan_trade(doc):
     """10b5-1 사전약정 매매 여부.
 
@@ -217,6 +225,11 @@ def parse_form4(path):
         shares = t.findtext("transactionAmounts/transactionShares/value")
         price = t.findtext("transactionAmounts/transactionPricePerShare/value")
         if not shares or not price:
+            continue
+        # nonDerivativeTable 에는 보통주 외에 우선주·워런트·유닛·LP지분도 들어간다.
+        # 이들은 티커가 가리키는 종목과 다른 증권이라 주당 가격이 시장가와
+        # 무관하다. 사모 우선주 인수가 자사주 매수로 잡히는 것을 막는다.
+        if NON_COMMON_RE.search(t.findtext("securityTitle/value") or ""):
             continue
         try:
             sh, px = float(shares), float(price)
