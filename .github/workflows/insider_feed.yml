@@ -11,15 +11,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
 
       # 의회 공시 중복 발송 방지용 상태. 키에 run_id를 넣어 매번 새로 저장하고,
       # restore-keys 로 직전 실행분을 복원한다.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: .state
           key: insider-feed-state-${{ github.run_id }}
