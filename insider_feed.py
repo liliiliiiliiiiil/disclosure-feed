@@ -221,7 +221,6 @@ def parse_form4(path):
         return []
 
     ticker = (doc.findtext("issuer/issuerTradingSymbol") or "").strip().upper()
-    issuer = (doc.findtext("issuer/issuerName") or "").strip()
     # 집합투자기구 등 상장 종목이 아닌 발행인은 심볼 자리에 N/A/NONE 을 넣는다.
     if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,5}", ticker) or ticker in ("N/A", "NONE"):
         return []
