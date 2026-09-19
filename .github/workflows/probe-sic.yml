@@ -1,0 +1,65 @@
+# 임시 탐색용. 티커 -> SIC 업종코드 경로의 실제 응답과 비용을 확인한다.
+# 확인이 끝나면 삭제한다. 수동 실행 전용.
+name: probe-sic
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - run: pip install requests
+      - run: |
+          python - <<'PY'
+          import json, os, time
+          import requests
+
+          s = requests.Session()
+          s.headers["User-Agent"] = os.environ["SEC_UA"]
+
+          print("=== 1. company_tickers.json ===", flush=True)
+          t0 = time.time()
+          r = s.get("https://www.sec.gov/files/company_tickers.json", timeout=60)
+          print(f"status={r.status_code} bytes={len(r.content):,} {time.time()-t0:.1f}s", flush=True)
+          j = r.json()
+          sample = list(j.items())[:2]
+          print(f"형태: {sample}", flush=True)
+          by_ticker = {v["ticker"].upper(): v for v in j.values()}
+          print(f"티커 수={len(by_ticker):,}", flush=True)
+
+          # 실측 관측 티커 + 참고
+          TICKERS = ["WMB", "EA", "AVB", "JNJ", "CEG", "OTIS", "NVDA", "LMT", "JPM",
+                     "IVV", "IJR", "AVUV", "SPYM", "WWSYX"]
+          print("\n=== 2. 티커 -> CIK 해석 ===", flush=True)
+          for t in TICKERS:
+              v = by_ticker.get(t)
+              print(f"  {t:<7} {'CIK ' + str(v['cik_str']).zfill(10) + '  ' + v['title'][:50] if v else '<없음>'}", flush=True)
+
+          print("\n=== 3. CIK -> SIC (submissions JSON) ===", flush=True)
+          for t in TICKERS:
+              v = by_ticker.get(t)
+              if not v:
+                  print(f"  {t:<7} 해석 불가 -> 업종 판정 제외", flush=True)
+                  continue
+              cik = str(v["cik_str"]).zfill(10)
+              t0 = time.time()
+              try:
+                  rr = s.get(f"https://data.sec.gov/submissions/CIK{cik}.json", timeout=60)
+                  rr.raise_for_status()
+              except Exception as e:
+                  print(f"  {t:<7} 실패: {e}", flush=True)
+                  continue
+              d = rr.json()
+              print(f"  {t:<7} sic={d.get('sic','')!r:<7} {d.get('sicDescription','')[:42]:<44}"
+                    f" entityType={d.get('entityType','')[:22]:<24} {len(rr.content)/1e6:.2f}MB {time.time()-t0:.1f}s",
+                    flush=True)
+              time.sleep(0.15)
+          PY
+        env:
+          SEC_UA: ${{ secrets.SEC_UA }}
