@@ -1,6 +1,5 @@
-# 임시 탐색용. Senate EFD 의 실제 응답 구조를 로그로 찍어 파서 작성 근거를 만든다.
-# senate_efd.py 가 실제 데이터로 검증되면 이 파일은 삭제한다.
-# 수동 실행 전용이며 스케줄에 걸리지 않는다.
+# 임시 검증용. senate_efd 모듈을 실제 EFD 상대로 돌려 결과를 로그로 남긴다.
+# 확인이 끝나면 이 파일은 삭제한다. 수동 실행 전용.
 name: probe-senate
 
 on:
@@ -15,160 +14,40 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
-      - run: pip install requests
+      - run: pip install -r requirements.txt
       - run: |
           python - <<'PY'
-          import json, re, sys, datetime as dt
-          from html.parser import HTMLParser
-          import requests
+          import datetime as dt
+          import senate_efd as se
 
-          BASE = "https://efdsearch.senate.gov"
-          UA = "disclosure-feed/1.0 (personal research)"
-          s = requests.Session()
-          s.headers["User-Agent"] = UA
+          since = dt.date.today() - dt.timedelta(days=30)
+          print(f"=== collect_senate(since={since}) ===", flush=True)
+          rows, scanned, fetched = se.collect_senate(since)
+          print(f"rows={len(rows)} scanned={len(scanned)} fetched={len(fetched)}", flush=True)
 
-          def show(label):
-              print(f"\n===== {label} =====", flush=True)
+          for r in rows[:12]:
+              print(f"  {r['ticker']:<6} {r['type']:<9} {r['asset_type']:<20} "
+                    f"{r['amount']:<22} min={r['value_min']:>10,.0f} "
+                    f"traded={r['traded']} who={r['who']}", flush=True)
+          for f_ in scanned[:5]:
+              print(f"  [지면] {f_['who']} {f_['filed']} {f_['url']}", flush=True)
 
-          def p(*a):
-              print(*a, flush=True)
+          print("\n=== 행 형태 점검 ===", flush=True)
+          if rows:
+              import house_ptr
+              need = {"chamber", "doc_id", "who", "district", "filed", "link",
+                      "key", "ticker", "type", "traded", "amount",
+                      "value", "value_min"}
+              missing = need - set(rows[0])
+              print(f"누락 키: {missing or '없음'}", flush=True)
+              print(f"key 예시: {rows[0]['key']}", flush=True)
 
-          class Fields(HTMLParser):
-              """폼 입력 이름과 select 옵션을 수집. 파라미터 이름을 추측하지 않기 위함."""
-              def __init__(self):
-                  super().__init__()
-                  self.inputs, self.selects, self.cur = [], {}, None
-                  self.opt, self.optval = False, None
-              def handle_starttag(self, tag, attrs):
-                  d = dict(attrs)
-                  if tag == "input":
-                      self.inputs.append((d.get("name"), d.get("type"), (d.get("value") or "")[:40]))
-                  elif tag == "select":
-                      self.cur = d.get("name"); self.selects[self.cur] = []
-                  elif tag == "option" and self.cur:
-                      self.opt, self.optval = True, d.get("value")
-                  elif tag == "form":
-                      p(f"[form] action={d.get('action')} method={d.get('method')}")
-              def handle_data(self, data):
-                  if self.opt and self.cur:
-                      self.selects[self.cur].append((self.optval, data.strip()[:40]))
-                      self.opt = False
-              def handle_endtag(self, tag):
-                  if tag == "select": self.cur = None
+          print("\n=== 두 번째 호출: 처리 완료 문서 건너뛰기 ===", flush=True)
+          rows2, scanned2, fetched2 = se.collect_senate(since, skip_docs=fetched)
+          print(f"rows={len(rows2)} scanned={len(scanned2)} fetched={len(fetched2)}"
+                "  <- 모두 0 이어야 한다", flush=True)
 
-          def dump_fields(html, label):
-              f = Fields(); f.feed(html)
-              p(f"[{label}] inputs:")
-              for n, t, v in f.inputs:
-                  if n: p(f"   name={n!r} type={t!r} value={v!r}")
-              for name, opts in f.selects.items():
-                  p(f"[{label}] select name={name!r} options={opts[:14]}")
-              return f
-
-          # ---------- A. 홈 (동의 인터스티셜) ----------
-          show("A: GET /search/home/")
-          r = s.get(f"{BASE}/search/home/", timeout=40)
-          p(f"status={r.status_code} final_url={r.url} len={len(r.text)}")
-          p(f"cookies={sorted(s.cookies.keys())}")
-          dump_fields(r.text, "home")
-          m = re.search(r"name=['\"]csrfmiddlewaretoken['\"][^>]*value=['\"]([^'\"]+)", r.text)
-          token = m.group(1) if m else None
-          p(f"csrfmiddlewaretoken found in body: {bool(token)}")
-          p(f"csrftoken cookie: {bool(s.cookies.get('csrftoken'))}")
-
-          if not token:
-              p("!! 토큰을 못 찾음. 본문 앞부분:")
-              p(r.text[:1500])
-              sys.exit(0)
-
-          # ---------- B. 동의 POST ----------
-          show("B: POST /search/home/ (prohibition agreement)")
-          payload = {"csrfmiddlewaretoken": token, "prohibition_agreement": "1"}
-          p(f"payload keys={sorted(payload)}")
-          r = s.post(f"{BASE}/search/home/", data=payload,
-                     headers={"Referer": f"{BASE}/search/home/"}, timeout=40)
-          p(f"status={r.status_code} final_url={r.url}")
-          p(f"history={[h.status_code for h in r.history]}")
-          p(f"cookies={sorted(s.cookies.keys())}")
-
-          # ---------- C. 검색 폼: 진짜 파라미터 이름 ----------
-          show("C: GET /search/ (실제 필드명 확보)")
-          r = s.get(f"{BASE}/search/", timeout=40)
-          p(f"status={r.status_code} final_url={r.url} len={len(r.text)}")
-          dump_fields(r.text, "search")
-          m = re.search(r"name=['\"]csrfmiddlewaretoken['\"][^>]*value=['\"]([^'\"]+)", r.text)
-          token = m.group(1) or token if m else token
-          for hint in ("report/data", "ajax", "url:"):
-              for h in re.findall(r"['\"]([^'\"]*%s[^'\"]*)['\"]" % re.escape(hint), r.text)[:5]:
-                  p(f"[js hint {hint}] {h[:120]}")
-
-          # ---------- D. 검색 API ----------
-          show("D: POST /search/report/data/")
-          since = (dt.date.today() - dt.timedelta(days=30)).strftime("%m/%d/%Y")
-          body = {
-              "start": "0", "length": "25", "report_types": "[11]",
-              "filer_types": "[]", "submitted_start_date": f"{since} 00:00:00",
-              "submitted_end_date": "", "candidate_state": "", "senator_state": "",
-              "office_id": "", "first_name": "", "last_name": "",
-              "csrfmiddlewaretoken": token,
-          }
-          p(f"sent: submitted_start_date={body['submitted_start_date']} report_types={body['report_types']}")
-          r = s.post(f"{BASE}/search/report/data/", data=body,
-                     headers={"Referer": f"{BASE}/search/",
-                              "X-Requested-With": "XMLHttpRequest"}, timeout=60)
-          p(f"status={r.status_code} content-type={r.headers.get('content-type')}")
-          rows = []
-          try:
-              j = r.json()
-              p(f"top-level keys={sorted(j)}")
-              for k, v in j.items():
-                  if k != "data":
-                      p(f"   {k}={v!r}"[:200])
-              rows = j.get("data") or []
-              p(f"row count={len(rows)}")
-              for i, row in enumerate(rows[:3]):
-                  p(f"   row[{i}] len={len(row)} = {json.dumps(row, ensure_ascii=False)[:500]}")
-          except ValueError:
-              p("!! JSON 아님. 본문 앞부분:")
-              p(r.text[:1500])
-
-          if not rows:
-              sys.exit(0)
-
-          # ---------- E. PTR 상세 페이지 ----------
-          show("E: GET 첫 보고서 상세")
-          href = re.search(r'href=[\'"]([^\'"]+)', rows[0][-2] if len(rows[0]) > 1 else "")
-          link = href.group(1) if href else None
-          p(f"추출된 링크={link!r}")
-          if not link:
-              p(f"링크 셀 원문: {rows[0]!r}"[:500]); sys.exit(0)
-          r = s.get(BASE + link if link.startswith("/") else link,
-                    headers={"Referer": f"{BASE}/search/"}, timeout=60)
-          p(f"status={r.status_code} final_url={r.url} len={len(r.text)}")
-          p(f"paper(스캔본) 여부: {'/paper/' in r.url}")
-
-          class Table(HTMLParser):
-              def __init__(self):
-                  super().__init__()
-                  self.ths, self.rows, self.cell, self.row, self.on = [], [], None, None, False
-              def handle_starttag(self, tag, attrs):
-                  if tag == "th": self.cell, self.on = [], True
-                  elif tag == "td": self.cell, self.on = [], True
-                  elif tag == "tr": self.row = []
-              def handle_data(self, d):
-                  if self.on and d.strip(): self.cell.append(d.strip())
-              def handle_endtag(self, tag):
-                  if tag == "th":
-                      self.ths.append(" ".join(self.cell)); self.on = False
-                  elif tag == "td":
-                      if self.row is not None: self.row.append(" ".join(self.cell))
-                      self.on = False
-                  elif tag == "tr" and self.row:
-                      self.rows.append(self.row); self.row = None
-
-          t = Table(); t.feed(r.text)
-          p(f"<th> 헤더 = {t.ths}")
-          p(f"데이터 행 수 = {len(t.rows)}")
-          for i, row in enumerate(t.rows[:4]):
-              p(f"   tr[{i}] len={len(row)} = {row}")
+          print("\n=== 필터 통과분 (CONGRESS_MIN_AMOUNT 하단 기준) ===", flush=True)
+          kept = [r for r in rows if r["value_min"] >= 15_000]
+          print(f"{len(kept)}/{len(rows)} 건", flush=True)
           PY

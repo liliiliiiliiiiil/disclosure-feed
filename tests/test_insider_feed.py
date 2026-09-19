@@ -96,6 +96,15 @@ class ParseForm4(unittest.TestCase):
             f._get = orig
 
 
+def _congress_row(doc, **kw):
+    r = {"chamber": "House", "doc_id": doc, "key": f"{doc}|AAPL|purchase",
+         "ticker": "AAPL", "type": "purchase", "amount": "$50,001 - $100,000",
+         "value": 100_000.0, "value_min": 50_001.0, "who": "Rep A",
+         "district": "CA01", "traded": "01/02/2025", "link": "http://x/a.pdf"}
+    r.update(kw)
+    return r
+
+
 def _row(**kw):
     base = {"ticker": "AAA", "src": "s1", "owners": ("X",), "title": "", "rank": "",
             "code": "P", "shares": 100.0, "value": 200_000.0, "plan": False,
@@ -236,22 +245,30 @@ class State(unittest.TestCase):
         f.STATE_PATH = self.orig
 
     def test_round_trip(self):
-        f.save_state({"k1", "k2"}, {"d1"}, 7)
-        self.assertEqual(f.load_state(), ({"k1", "k2"}, {"d1"}, 7))
+        f.save_state({"k1", "k2"}, {"d1"}, {"house": 7, "senate": 3})
+        self.assertEqual(f.load_state(),
+                         ({"k1", "k2"}, {"d1"}, {"house": 7, "senate": 3}))
 
     def test_reads_legacy_flat_list(self):
         with open(f.STATE_PATH, "w") as fh:
             json.dump(["k1", "k2"], fh)
-        self.assertEqual(f.load_state(), ({"k1", "k2"}, set(), 0))
+        self.assertEqual(f.load_state(),
+                         ({"k1", "k2"}, set(), {"house": 0, "senate": 0}))
 
     def test_reads_state_written_before_the_counter_existed(self):
         with open(f.STATE_PATH, "w") as fh:
             json.dump({"keys": ["k1"], "docs": ["d1"]}, fh)
-        self.assertEqual(f.load_state(), ({"k1"}, {"d1"}, 0))
+        self.assertEqual(f.load_state(), ({"k1"}, {"d1"}, {"house": 0, "senate": 0}))
+
+    def test_reads_counter_from_before_the_senate_was_added(self):
+        # 당시 dry 는 하원 하나뿐이라 정수였다.
+        with open(f.STATE_PATH, "w") as fh:
+            json.dump({"keys": [], "docs": [], "dry": 12}, fh)
+        self.assertEqual(f.load_state()[2], {"house": 12, "senate": 0})
 
     def test_missing_file(self):
         f.STATE_PATH = os.path.join(self.tmp, "nope", "seen.json")
-        self.assertEqual(f.load_state(), (set(), set(), 0))
+        self.assertEqual(f.load_state(), (set(), set(), {"house": 0, "senate": 0}))
 
 
 class DryStreak(unittest.TestCase):
@@ -282,51 +299,73 @@ class CongressAlert(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.orig_path, self.orig_send = f.STATE_PATH, f.send
-        self.orig_collect = f.house_ptr.collect_house
+        self.orig_collectors = f.COLLECTORS
         f.STATE_PATH = os.path.join(self.tmp, "seen.json")
         self.sent = []
         f.send = self.sent.append
 
     def tearDown(self):
         f.STATE_PATH, f.send = self.orig_path, self.orig_send
-        f.house_ptr.collect_house = self.orig_collect
+        f.COLLECTORS = self.orig_collectors
 
-    def feed(self, docs, rows=()):
-        f.house_ptr.collect_house = lambda since, skip_docs=(): (
-            [r for r in rows], [], {d for d in docs if d not in skip_docs})
+    def feed(self, docs=(), rows=(), senate=None):
+        """두 수집기를 모두 대체한다. 하나라도 빠뜨리면 실제 EFD 를 때린다."""
+        def house(since, skip_docs=()):
+            return ([r for r in rows], [],
+                    {d for d in docs if d not in skip_docs})
+        f.COLLECTORS = (("house", house),
+                        ("senate", senate or (lambda since, skip_docs=(): ([], [], set()))))
 
     def test_alerts_only_after_the_threshold(self):
-        # 문턱 직전까지는 조용하다.
-        f.save_state(set(), set(), f.PTR_DRY_DOCS_ALERT - 2)
+        f.save_state(set(), set(), {"house": f.PTR_DRY_DOCS_ALERT - 2})
         self.feed({"a"})
         f.run_congress()
         self.assertEqual(self.sent, [])
-        self.assertEqual(f.load_state()[2], f.PTR_DRY_DOCS_ALERT - 1)
+        self.assertEqual(f.load_state()[2]["house"], f.PTR_DRY_DOCS_ALERT - 1)
 
-        # 한 건 더 헛파싱하면 경보가 나가고 실행도 실패로 끝난다.
         self.feed({"b"})
         with self.assertRaises(RuntimeError):
             f.run_congress()
         self.assertEqual(len(self.sent), 1)
+        self.assertIn("하원", self.sent[0])
         self.assertIn("파서 점검 필요", self.sent[0])
 
     def test_counter_survives_the_raised_alert(self):
-        # 경보 예외보다 먼저 저장되지 않으면 카운터가 제자리걸음을 한다.
-        f.save_state(set(), set(), f.PTR_DRY_DOCS_ALERT)
+        f.save_state(set(), set(), {"house": f.PTR_DRY_DOCS_ALERT})
         self.feed({"a"})
         with self.assertRaises(RuntimeError):
             f.run_congress()
-        self.assertEqual(f.load_state()[2], f.PTR_DRY_DOCS_ALERT + 1)
+        self.assertEqual(f.load_state()[2]["house"], f.PTR_DRY_DOCS_ALERT + 1)
+
+    def test_chambers_are_counted_separately(self):
+        # 물량 많은 쪽이 고장 난 쪽을 가리면 안 된다.
+        def senate(since, skip_docs=()):
+            return [], [], {"s1"}
+        f.save_state(set(), set(), {"house": 0, "senate": f.PTR_DRY_DOCS_ALERT - 1})
+        self.feed({"h1"}, rows=[_congress_row("h1")], senate=senate)
+        with self.assertRaises(RuntimeError) as cm:
+            f.run_congress()
+        self.assertIn("상원", str(cm.exception))
+        state = f.load_state()[2]
+        self.assertEqual(state["house"], 0)       # 하원은 거래가 나와 리셋
+        self.assertEqual(state["senate"], f.PTR_DRY_DOCS_ALERT)
+
+    def test_one_chamber_failing_does_not_block_the_other(self):
+        def senate(since, skip_docs=()):
+            raise RuntimeError("EFD 양식 변경")
+        self.feed({"h1"}, rows=[_congress_row("h1")], senate=senate)
+        with self.assertRaises(RuntimeError) as cm:
+            f.run_congress()
+        self.assertIn("수집 실패", str(cm.exception))
+        # 하원 공시는 그래도 나갔어야 한다.
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("AAPL", self.sent[0])
 
     def test_healthy_run_stays_quiet_and_resets(self):
-        f.save_state(set(), set(), f.PTR_DRY_DOCS_ALERT - 1)
-        self.feed({"a"}, rows=[{
-            "doc_id": "a", "key": "a|AAPL|purchase", "ticker": "AAPL",
-            "type": "purchase", "amount": "$50,001 - $100,000", "value": 100_000.0,
-            "value_min": 50_001.0, "who": "Rep A", "district": "CA01",
-            "traded": "01/02/2025", "link": "http://x/a.pdf"}])
+        f.save_state(set(), set(), {"house": f.PTR_DRY_DOCS_ALERT - 1})
+        self.feed({"a"}, rows=[_congress_row("a")])
         f.run_congress()
-        self.assertEqual(f.load_state()[2], 0)
+        self.assertEqual(f.load_state()[2]["house"], 0)
         self.assertEqual(len(self.sent), 1)
         self.assertNotIn("파서 점검 필요", self.sent[0])
 

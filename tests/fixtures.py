@@ -79,3 +79,38 @@ Nvidia Corp (NVDA) [ST] E 01/05/2025 01/20/2025 $100,001 - $250,000
 Berkshire (BRK.B) [ST] P 01/06/2025 01/20/2025 Over $50,000,000
 City of Somewhere Municipal Bond 4.5% P 01/07/2025 01/20/2025 $250,001 - $500,000
 """
+
+
+# ---- 상원 EFD ----
+# 아래 두 개는 지어낸 것이 아니라 2026-09-19 탐색 실행이 실제 EFD 에서
+# 받아온 응답을 그대로 옮긴 것이다. 헤더 9칸, 검색 행 5칸.
+
+SENATE_SEARCH_JSON = {
+    "result": "ok", "draw": 0, "recordsTotal": 2, "recordsFiltered": 2,
+    "data": [
+        ["Alan", "Armstrong", "Armstrong, Alan (Senator)",
+         '<a href="/search/view/ptr/b999bc0e-3eb0-4ca9-ab07-8e8f2e04b41f/"'
+         ' target="_blank">Periodic Transaction Report for 09/17/2026</a>',
+         "09/17/2026"],
+        ["Angus S", "King, Jr.", "King, Angus (Senator)",
+         '<a href="/search/view/paper/e67c6e56-c81e-4e74-b960-849a460165e2/"'
+         ' target="_blank">Periodic Transaction Report for 09/14/2026</a>',
+         "09/14/2026"],
+    ],
+}
+
+SENATE_PTR_HTML = """<table><thead><tr>
+<th>#</th><th>Transaction Date</th><th>Owner</th><th>Ticker</th><th>Asset Name</th>
+<th>Asset Type</th><th>Type</th><th>Amount</th><th>Comment</th></tr></thead><tbody>
+<tr><td>4</td><td>08/20/2026</td><td>Joint</td><td>WMB</td>
+<td>Williams Companies, Inc. (The) Common Stock Option Type: Call Strike price: $75.00 Expires: 2026-08-21</td>
+<td>Stock Option</td><td>Purchase</td><td>$15,001 - $50,000</td><td>--</td></tr>
+<tr><td>3</td><td>08/04/2026</td><td>Joint</td><td>--</td><td>Electronic Arts Inc. (EA)</td>
+<td>Stock</td><td>Sale (Full)</td><td>$1,001 - $15,000</td><td>Sale due to corporate transaction</td></tr>
+<tr><td>2</td><td>08/14/2026</td><td>Joint</td><td>--</td>
+<td>AvalonBay Communities, Inc. Common Stock (AVB) (Exchanged) VMRK - Vivmark Residential Common Shares of Beneficial Interest (Received)</td>
+<td>Stock</td><td>Exchange</td><td>$1,001 - $15,000</td><td>--</td></tr>
+<tr><td>1</td><td>08/19/2026</td><td>Joint</td><td>--</td>
+<td>City of Somewhere Municipal Bond 4.5%</td>
+<td>Municipal Security</td><td>Purchase</td><td>$50,001 - $100,000</td><td>--</td></tr>
+</tbody></table>"""

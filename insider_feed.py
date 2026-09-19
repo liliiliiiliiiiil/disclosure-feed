@@ -3,8 +3,9 @@
 두 소스는 신고지연(2영업일 vs 45일)과 금액 정밀도(실액 vs 구간)가 달라
 서로 다른 필터를 적용하고 별도 메시지로 전송한다.
 
-하원 PTR 수집은 house_ptr 모듈 참조 (Clerk 공식 소스 직접 파싱).
-상원(efdsearch)은 접속 동의 절차가 필요해 아직 미포함.
+의회 PTR 수집은 house_ptr(Clerk)·senate_efd(EFD) 모듈 참조. 두 원(院)은
+신고지연과 금액 정밀도가 같아 한 메시지로 합쳐 보내고, 수집 실패와 파서
+건강도만 원별로 따로 본다.
 
 환경변수:
   SEC_UA           SEC 필수 User-Agent. 예: "Yunchan Kim yunchan@example.com"
@@ -25,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 
 import house_ptr
+import senate_efd
 
 # import 시점에 죽으면 테스트조차 불러올 수 없어 여기서는 읽기만 하고,
 # 실제 유효성은 main() 에서 한 번에 확인한다.
@@ -65,9 +67,11 @@ FORM4_ALERT_MIN_FILINGS = 100
 # 자산(지방채·국채·펀드)만 든 신고가 흔해서 한 번의 실행에서 거래 0건은 정상이고,
 # 실행 단위로 세면 오탐이 난다. 그래서 실행이 아니라 문서를 누적해서 센다:
 # 텍스트 레이어가 있는 PTR 을 연속 이만큼 파싱하고도 거래가 하나도 안 나오면
-# 고장으로 본다. 스캔본은 거래가 안 나오는 게 정상이라 세지 않는다.
+# 고장으로 본다. 스캔·지면 제출본은 거래가 안 나오는 게 정상이라 세지 않는다.
 # 관측상 PTR 여러 건 중 하나 꼴로는 거래가 나오므로, 30건 연속 0은 사실상 고장이다.
+# 원별로 따로 센다. 합치면 물량 많은 쪽이 고장 난 쪽을 가린다.
 PTR_DRY_DOCS_ALERT = 30
+CHAMBERS = {"house": "하원", "senate": "상원"}
 
 
 # ---------- HTTP ----------
@@ -399,8 +403,16 @@ def filter_congress(rows):
 
 # ---------- 중복 발송 방지 ----------
 
+def _dry_map(v):
+    """dry 를 {원: 연속 헛파싱 수} 로 정규화. 상원 추가 전에는 정수였다."""
+    if isinstance(v, int):
+        v = {"house": v}
+    v = v or {}
+    return {c: int(v.get(c, 0)) for c in CHAMBERS}
+
+
 def load_state():
-    """(발송 완료 거래, 처리 완료 PTR 문서, 연속 헛파싱 문서 수).
+    """(발송 완료 거래, 처리 완료 PTR 문서, 원별 연속 헛파싱 문서 수).
 
     구버전은 평면 키 목록이었으므로 그 형태도 읽는다.
     """
@@ -408,12 +420,12 @@ def load_state():
         with open(STATE_PATH) as f:
             data = json.load(f)
     except (OSError, ValueError):
-        return set(), set(), 0
+        return set(), set(), _dry_map(None)
     if isinstance(data, list):
-        return set(data), set(), 0
+        return set(data), set(), _dry_map(None)
     return (set(data.get("keys", ())),
             set(data.get("docs", ())),
-            int(data.get("dry", 0)))
+            _dry_map(data.get("dry")))
 
 
 def save_state(keys, docs, dry):
@@ -423,7 +435,7 @@ def save_state(keys, docs, dry):
     with open(STATE_PATH, "w") as f:                      # 무한 증가 방지
         json.dump({"keys": sorted(keys)[-50_000:],
                    "docs": sorted(docs)[-50_000:],
-                   "dry": dry}, f)
+                   "dry": _dry_map(dry)}, f)
 
 
 def dry_streak(prev, parsed, found):
@@ -538,23 +550,24 @@ def build_insider_message(buys, sells, date, total, filings, failed, broken):
     return [(ln, None) for ln in lines]
 
 
-def build_congress_message(rows, scanned, since, dry=0):
+def build_congress_message(rows, scanned, since, broken=None):
     """(줄, 키) 목록. 각 거래 줄에는 그 거래의 상태 키를 붙인다.
 
     TOP_N 으로 잘라내지 않는다. 잘린 분까지 발송 완료로 기록되어 영영
     사라지던 문제 때문이며, 분량은 paginate 가 메시지 분할로 처리한다.
 
-    dry 가 0 이 아니면 연속 헛파싱 경보를 머리에 붙인다.
+    broken 은 {원: 연속 헛파싱 수}. 비어 있지 않으면 경보를 머리에 붙인다.
     """
     def group(kind):
         return sorted([r for r in rows if r["type"] == kind], key=lambda r: -r["value"])
 
     items = [
-        (f"<b>🏛 하원 PTR</b> — {since:%m/%d} 이후 신규 제출", None),
-        ("<i>신고지연 최대 45일 · 금액은 구간 공시(상단 기준 정렬)</i>", None),
+        (f"<b>🏛 의회 PTR</b> — {since:%m/%d} 이후 신규 제출", None),
+        ("<i>하원·상원 · 신고지연 최대 45일 · 금액은 구간 공시(상단 기준 정렬)</i>", None),
     ]
-    if dry:
-        items.append((f"<i>⚠️ PTR {dry}건 연속 거래 0건 — 파서 점검 필요</i>", None))
+    for n, v in sorted((broken or {}).items()):
+        items.append(
+            (f"<i>⚠️ {CHAMBERS[n]} PTR {v}건 연속 거래 0건 — 파서 점검 필요</i>", None))
     items.append(("", None))
     # 교환(E)은 드물어 항상 비어 있는 칸을 만들 필요가 없다. 다만 예전처럼
     # 조용히 버리면 상태에는 기록되고 화면에는 없는 건이 생긴다.
@@ -570,14 +583,14 @@ def build_congress_message(rows, scanned, since, dry=0):
         for r in g:
             items.append((
                 f'{tv(r["ticker"])} {esc(r["amount"])} — {esc(r["who"])} '
-                f'<i>({esc(r["district"])}, 거래 {esc(r["traded"])})</i> '
+                f'<i>({esc(r["district"] or r["chamber"])}, 거래 {esc(r["traded"])})</i> '
                 f'<a href="{esc(r["link"])}">PTR</a>',
                 r["key"],
             ))
         items.append(("", None))
 
     if scanned:
-        items.append((f"<b>⚠️ 스캔 제출본 {len(scanned)}건</b> <i>(자동 파싱 불가)</i>", None))
+        items.append((f"<b>⚠️ 스캔·지면 제출본 {len(scanned)}건</b> <i>(자동 파싱 불가)</i>", None))
         for f in scanned:
             items.append((
                 f'· <a href="{esc(f["url"])}">{esc(f["who"])}</a> {f["filed"]:%m/%d}',
@@ -622,20 +635,37 @@ def run_insider():
         raise RuntimeError(f"Form 4 제출 {filings}건에서 거래 0건 추출 — 파서 점검 필요")
 
 
+COLLECTORS = (("house", house_ptr.collect_house),
+              ("senate", senate_efd.collect_senate))
+
+
 def run_congress():
     since = dt.date.today() - dt.timedelta(days=CONGRESS_LOOKBACK_DAYS)
     seen, done_docs, dry = load_state()
-    rows, scanned, fetched = house_ptr.collect_house(since, skip_docs=done_docs)
 
-    dry = dry_streak(dry, len(fetched) - len(scanned), len(rows))
-    broken = dry >= PTR_DRY_DOCS_ALERT
+    rows, scanned, fetched, failed = [], [], set(), []
+    for name, collect in COLLECTORS:
+        # 두 원은 소스가 완전히 다르다(Clerk ZIP+PDF vs EFD 검색+HTML).
+        # 한쪽 서식이 바뀌어도 다른 쪽 공시는 계속 보낸다.
+        try:
+            r, sc, fe = collect(since, skip_docs=done_docs)
+        except Exception as e:
+            failed.append(name)
+            print(f"[error] {CHAMBERS[name]} PTR 수집 실패: {e!r}", file=sys.stderr)
+            continue
+        dry[name] = dry_streak(dry[name], len(fe) - len(sc), len(r))
+        rows += r
+        scanned += sc
+        fetched |= fe
+
+    broken = {n: v for n, v in dry.items() if v >= PTR_DRY_DOCS_ALERT}
 
     eligible = filter_congress(rows)
     fresh = [r for r in eligible if r["key"] not in seen]
 
     sent = set()
     if fresh or scanned or broken:
-        msgs, sent = paginate(build_congress_message(fresh, scanned, since, dry if broken else 0))
+        msgs, sent = paginate(build_congress_message(fresh, scanned, since, broken))
         for m in msgs:
             send(m)
     seen |= sent
@@ -651,7 +681,11 @@ def run_congress():
     save_state(seen, done_docs | (fetched - pending), dry)
 
     if broken:
-        raise RuntimeError(f"하원 PTR {dry}건 연속 파싱 0건 — 파서 점검 필요")
+        raise RuntimeError("PTR 연속 파싱 0건 — " + ", ".join(
+            f"{CHAMBERS[n]} {v}건" for n, v in sorted(broken.items())))
+    if failed:
+        raise RuntimeError(
+            "PTR 수집 실패: " + ", ".join(CHAMBERS[n] for n in failed))
 
 
 def main():
