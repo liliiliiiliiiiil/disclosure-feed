@@ -9,8 +9,12 @@ because the underlying filings have very different reporting lag and precision.
 | Corporate insiders | SEC EDGAR, Form 4 | 2 business days | Exact (shares x price) |
 | U.S. House members | House Clerk, PTR | Up to 45 days | Bracketed range |
 
-Runs on GitHub Actions Tuesday through Saturday. No third-party data vendors —
-both sources are official government endpoints.
+Runs on GitHub Actions Tuesday through Saturday. The cron asks for 05:30 UTC,
+but GitHub's scheduler has consistently fired it about four hours late, so the
+messages actually arrive between 09:30 and 10:15 UTC. That only shifts when the
+digest lands, not what is in it: the target date comes from the calendar day
+rather than the clock. No third-party data vendors — both sources are official
+government endpoints.
 
 ## Why filtering matters
 
