@@ -36,12 +36,21 @@ Thresholds live at the top of `insider_feed.py`.
 
 ```
 .github/workflows/insider_feed.yml   Schedule and secrets
+.github/workflows/tests.yml          Parser regression tests on every push
 insider_feed.py                      Entry point, Form 4 collection, Telegram
 house_ptr.py                         House PTR collection (imported module)
+requirements.txt                     Pinned deps (PDF text extraction is
+                                     sensitive to the pdfminer version)
+tests/                               Fixture-based tests, no network needed
 ```
 
 `.state/seen.json` is created at runtime to suppress duplicate House filings
 across runs. It is restored and saved by `actions/cache` and is not committed.
+It holds two sets: `keys` for transactions already sent, and `docs` for PTR
+documents already fully processed. The second one is what stops a PTR from
+being re-downloaded on all five runs of its seven-day window. A document is
+only recorded once everything it contributed has actually been delivered, so
+nothing is lost to a truncated digest.
 
 ## Setup
 
@@ -61,12 +70,21 @@ seven-day backlog; later runs only send filings not already in the state cache.
 Run locally with:
 
 ```bash
-pip install requests pdfplumber
+pip install -r requirements.txt
 export SEC_UA="Your Name your@email.com"
 export TELEGRAM_TOKEN=...
 export TELEGRAM_CHAT_ID=...
 python insider_feed.py
 ```
+
+Run the tests with:
+
+```bash
+python -m unittest discover -s tests -t . -v
+```
+
+They use recorded fixtures rather than live endpoints, so they need no network
+and no secrets.
 
 ## How House PTRs are parsed
 
@@ -83,6 +101,17 @@ mangle letter case, which is normalized on extraction.
 Only assets with a parenthesized ticker are captured. Municipal bonds, treasury
 notes, and unlisted funds are deliberately dropped.
 
+Amounts are disclosed as a bracket, so both ends are kept. The filter uses the
+**lower** bound, since that is the number the filing actually guarantees, and
+`CONGRESS_MIN_AMOUNT` is $15,000 — the $15,001-$50,000 bracket is the smallest
+one that passes. Sorting and display use the upper bound, which gives a better
+sense of scale. Purchases, sales, and exchanges (`E`) are all reported; the
+exchange section is only rendered when there is something in it.
+
+A digest that would exceed Telegram's 4,096-character limit is split across
+messages rather than truncated, up to four per run. Anything beyond that is
+left unrecorded and picked up on the next run.
+
 ## Known limitations
 
 - **Senate filings are not included.** The Senate EFD search requires accepting
@@ -95,9 +124,25 @@ notes, and unlisted funds are deliberately dropped.
 - **Committee assignments are not cross-referenced.** The strongest signal in
   congressional trading is the overlap between a member's committee jurisdiction
   and the sector they traded. That mapping is not implemented yet.
+- **Amended PTRs are reported twice.** An amendment gets its own DocID and the
+  Clerk index does not link it back to the filing it corrects, so both the
+  original and the amendment come through as separate entries.
 - The 10b5-1 flag only exists on filings made after the December 2022 rule
   change. Older filings fall through as unflagged, which means "undetermined"
   rather than "not a planned trade".
+
+## Failure handling
+
+Transient HTTP errors (429, 5xx, connection resets, timeouts) are retried three
+times with exponential backoff. A filing that still cannot be fetched is
+counted rather than dropped silently, and the count appears in the digest.
+
+Format changes at the source would otherwise produce an empty digest that looks
+exactly like a quiet day. If a run sees at least 100 Form 4 filings and extracts
+no transactions at all — or fetches at least 20 PTRs and parses none — it says
+so in the message and exits non-zero, which turns the Actions run red.
+
+The two feeds are independent: one failing does not stop the other.
 
 ## Data sources and attribution
 

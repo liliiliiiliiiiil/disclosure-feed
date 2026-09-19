@@ -26,9 +26,11 @@ import requests
 
 import house_ptr
 
-SEC_UA = os.environ["SEC_UA"]
-TG_TOKEN = os.environ["TELEGRAM_TOKEN"]
-TG_CHAT = os.environ["TELEGRAM_CHAT_ID"]
+# import 시점에 죽으면 테스트조차 불러올 수 없어 여기서는 읽기만 하고,
+# 실제 유효성은 main() 에서 한 번에 확인한다.
+SEC_UA = os.environ.get("SEC_UA", "")
+TG_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 STATE_PATH = os.environ.get("STATE_PATH", ".state/seen.json")
 
 # --- 내부자(Form 4) 필터 ---
@@ -39,11 +41,24 @@ CLUSTER_MIN = 3               # 동일 종목 서로 다른 신고자 수
 TOP_N = 12
 
 # --- 의회 PTR 필터 ---
+# 구간 공시의 '하단' 기준. 하단을 쓰는 이유는 "최소 이만큼은 거래했다"가
+# 확실한 수치이기 때문이다. 상단 기준 + 50,000 이던 이전 설정은 실질적으로
+# $15,001-$50,000 구간까지 통과시키고 있었고, 여기서는 그 실제 동작을
+# 그대로 두되 상수가 사실을 말하도록 맞췄다.
 CONGRESS_LOOKBACK_DAYS = 7
-CONGRESS_MIN_AMOUNT = 50_000  # 구간 상단 기준
+CONGRESS_MIN_AMOUNT = 15_000
 
 SEC_WORKERS = 6
 SEC_RATE = 8.0                # req/sec 상한 (SEC 공식 한도 10)
+
+HTTP_RETRIES = 3
+RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+
+# --- 이상 감지 ---
+# 소스 포맷이 바뀌면 파싱 결과가 0건이 되는데, 그대로 두면 "조용한 날"과
+# "고장 난 날"이 구분되지 않는다. 표본이 충분한데 0건이면 고장으로 본다.
+FORM4_ALERT_MIN_FILINGS = 100
+PTR_ALERT_MIN_DOCS = 20
 
 
 # ---------- HTTP ----------
@@ -73,10 +88,24 @@ def _session():
 
 
 def _get(url):
-    _throttle()
-    r = _session().get(url, timeout=30)
-    r.raise_for_status()
-    return r
+    """일시적 오류(429/5xx/네트워크)는 지수 백오프로 재시도한다.
+
+    재시도가 없으면 SEC 가 순간 503 을 던질 때 해당 제출이 조용히 빠지고
+    다이제스트는 멀쩡한 얼굴로 발송된다. 끝내 실패한 건은 호출 측에서
+    개수를 세어 메시지에 표시한다.
+    """
+    for attempt in range(HTTP_RETRIES + 1):
+        last = attempt == HTTP_RETRIES
+        _throttle()
+        try:
+            r = _session().get(url, timeout=30)
+            if r.status_code not in RETRY_STATUS or last:
+                r.raise_for_status()
+                return r
+        except (requests.ConnectionError, requests.Timeout):
+            if last:
+                raise
+        time.sleep(2 ** attempt)
 
 
 # ---------- SEC Form 4 ----------
@@ -173,11 +202,15 @@ def _rank(title, is_director, is_ten_pct):
 
 
 def parse_form4(path):
-    """제출 파일 하나에서 P/S 거래를 추출."""
+    """제출 파일 하나에서 P/S 거래를 추출.
+
+    반환: 거래 목록. 수집 자체에 실패하면 None (누락 집계용으로 빈 목록과 구분).
+    """
     try:
         raw = _get(f"https://www.sec.gov/Archives/{path}").text
-    except requests.HTTPError:
-        return []
+    except requests.RequestException as e:
+        print(f"[warn] 제출 수집 실패 {path}: {e}", file=sys.stderr)
+        return None
 
     m = re.search(r"<ownershipDocument>.*?</ownershipDocument>", raw, re.S)
     if not m:
@@ -193,27 +226,34 @@ def parse_form4(path):
     if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,5}", ticker) or ticker in ("N/A", "NONE"):
         return []
 
-    # 공동신고 대응: reportingOwner가 복수일 수 있다.
-    owners, titles = [], []
+    # 공동신고 대응: reportingOwner 가 복수일 수 있다.
+    owners = []                  # (이름, 직함)
     is_director = is_ten_pct = False
     for ro in doc.findall("reportingOwner"):
         name = (ro.findtext("reportingOwnerId/rptOwnerName") or "").strip()
-        if name:
-            owners.append(name)
-        rel = ro.find("reportingOwnerRelationship")
-        if rel is None:
+        if not name:
             continue
-        t = (rel.findtext("officerTitle") or "").strip()
-        if t:
-            titles.append(t)
-        if rel.findtext("isDirector") in ("1", "true"):
-            is_director = True
-        if rel.findtext("isTenPercentOwner") in ("1", "true"):
-            is_ten_pct = True
+        rel = ro.find("reportingOwnerRelationship")
+        t = ""
+        if rel is not None:
+            t = (rel.findtext("officerTitle") or "").strip()
+            if rel.findtext("isDirector") in ("1", "true"):
+                is_director = True
+            if rel.findtext("isTenPercentOwner") in ("1", "true"):
+                is_ten_pct = True
+        owners.append((name, t))
     if not owners:
         return []
 
-    title = max(titles, key=len) if titles else ""
+    # 직함은 그 직함을 가진 사람에게 붙어야 한다. 공동신고에서 가장 긴 직함만
+    # 뽑아 첫 신고자 옆에 찍으면 남의 직책이 오귀속되고, 그 직함으로 rank 까지
+    # 올라가 필터를 통과한다. 표시 대상을 직함 주인으로 맞춘다.
+    primary = next((o for o in owners if o[1] and SENIOR_PAT.search(o[1])), None)
+    if primary is None:
+        primary = next((o for o in owners if o[1]), owners[0])
+    names = [primary[0]] + [n for n, _ in owners if n != primary[0]]
+    title = primary[1]
+
     rank = _rank(title, is_director, is_ten_pct)
     is_plan = _is_plan_trade(doc)   # 문서 단위 체크박스이므로 한 번만 본다
 
@@ -241,7 +281,7 @@ def parse_form4(path):
         out.append({
             "ticker": ticker,
             "src": path.rsplit("/", 1)[-1].rsplit(".", 1)[0],
-            "owners": tuple(owners),
+            "owners": tuple(names),
             "title": title or (rank.title() if rank in ("DIRECTOR",) else ""),
             "rank": rank,
             "code": code,
@@ -254,13 +294,17 @@ def parse_form4(path):
 
 
 def collect_form4(date):
+    """반환: (거래 행, 수집 실패 제출 수, 전체 제출 수)."""
     paths = form4_filings(date)
     print(f"[info] Form 4 제출 {len(paths)}건 수집 시작", file=sys.stderr)
-    rows = []
+    rows, failed = [], 0
     with ThreadPoolExecutor(max_workers=SEC_WORKERS) as ex:
         for chunk in ex.map(parse_form4, paths):
-            rows.extend(chunk)
-    return rows
+            if chunk is None:
+                failed += 1
+            else:
+                rows.extend(chunk)
+    return rows, failed, len(paths)
 
 
 def aggregate(rows):
@@ -287,16 +331,25 @@ def aggregate(rows):
     return list(merged.values())
 
 
+def _buy_eligible(r):
+    """클러스터 집계와 최종 필터가 공유하는 '유효 매수' 판정."""
+    return r["code"] == "P" and not r["plan"] and r["value"] >= MIN_BUY_VALUE
+
+
 def annotate_cluster(rows):
     """동일 종목을 매수한 '독립적인 신고 건수'를 각 행에 붙인다.
 
     신고자 이름 수가 아니라 제출 파일 수를 센다. 계열 펀드 여러 곳이
     한 장에 공동신고한 것은 하나의 판단이지 여러 사람의 합의가 아니므로,
     이름으로 세면 가짜 클러스터가 만들어진다.
+
+    금액 하한과 10b5-1 제외를 통과한 매수만 센다. 필터 이전 원시 P 를 세면
+    $500 짜리 매수나 계획매매가 정원을 채워, 자격 없는 건을 클러스터 조건으로
+    통과시키고 🔥 까지 붙인다.
     """
     by_ticker = {}
     for r in rows:
-        if r["code"] == "P":
+        if _buy_eligible(r):
             by_ticker.setdefault(r["ticker"], set()).add(r["src"])
     for r in rows:
         r["cluster"] = len(by_ticker.get(r["ticker"], ())) if r["code"] == "P" else 0
@@ -311,9 +364,7 @@ def filter_buys(rows):
     """
     out = [
         r for r in rows
-        if r["code"] == "P"
-        and not r["plan"]
-        and r["value"] >= MIN_BUY_VALUE
+        if _buy_eligible(r)
         and (r["rank"] == "SENIOR"
              or r["cluster"] >= CLUSTER_MIN
              or r["value"] >= BIG_BUY_VALUE)
@@ -334,25 +385,34 @@ def filter_sells(rows):
 # ---------- 의회 PTR ----------
 
 def filter_congress(rows):
-    return [r for r in rows if r["value"] >= CONGRESS_MIN_AMOUNT]
+    """구간 하단 기준. 상단(value)은 정렬·표시에만 쓴다."""
+    return [r for r in rows if r["value_min"] >= CONGRESS_MIN_AMOUNT]
 
 
 # ---------- 중복 발송 방지 ----------
 
-def load_seen():
+def load_state():
+    """{"keys": 발송 완료 거래, "docs": 처리 완료 PTR 문서}.
+
+    구버전은 평면 키 목록이었으므로 그 형태도 읽는다.
+    """
     try:
         with open(STATE_PATH) as f:
-            return set(json.load(f))
+            data = json.load(f)
     except (OSError, ValueError):
-        return set()
+        return set(), set()
+    if isinstance(data, list):
+        return set(data), set()
+    return set(data.get("keys", ())), set(data.get("docs", ()))
 
 
-def save_seen(seen):
+def save_state(keys, docs):
     d = os.path.dirname(STATE_PATH)
     if d:
         os.makedirs(d, exist_ok=True)
-    with open(STATE_PATH, "w") as f:
-        json.dump(sorted(seen)[-50_000:], f)  # 무한 증가 방지
+    with open(STATE_PATH, "w") as f:                      # 무한 증가 방지
+        json.dump({"keys": sorted(keys)[-50_000:],
+                   "docs": sorted(docs)[-50_000:]}, f)
 
 
 # ---------- 출력 ----------
@@ -373,7 +433,9 @@ def price(v):
 def money(v):
     if v >= 1e6:
         return f"${v/1e6:.1f}M"
-    return f"${v/1e3:.0f}K"
+    if v >= 1e3:
+        return f"${v/1e3:.0f}K"
+    return f"${v:,.0f}"
 
 
 def who_of(r):
@@ -383,24 +445,61 @@ def who_of(r):
     return n
 
 
-def clamp(lines, limit=3900):
-    out, n = [], 0
-    for ln in lines:
-        if n + len(ln) + 1 > limit:
-            out.append("…")
-            break
-        out.append(ln)
-        n += len(ln) + 1
-    return "\n".join(out)
+TAG_RE = re.compile(r"<[^>]+>")
+# Bot API sendMessage 는 "1-4096 characters after entities parsing" 이므로
+# 상한은 마크업을 뺀 가시 길이에 걸린다. <a href="...tradingview..."> 한 줄이
+# 태그만으로 70자 넘게 먹는데, 원문 길이로 세면 실제 여유의 절반도 못 쓴다.
+MSG_VISIBLE_LIMIT = 3800
+MAX_MESSAGES = 4
+CONT = "<i>(이어서)</i>"
 
 
-def build_insider_message(buys, sells, date, total):
+def paginate(items):
+    """(줄, 키) 목록을 여러 텔레그램 메시지로 나눈다.
+
+    반환: (메시지 목록, 실제로 담긴 키 집합)
+
+    한 번에 잘라내지 않고 나누는 이유는, 잘린 줄까지 발송 완료로 기록해
+    영구 누락을 만들었기 때문이다. MAX_MESSAGES 를 넘긴 분량은 키를 돌려주지
+    않으므로 상태에 기록되지 않고 다음 실행에서 다시 잡힌다.
+    """
+    msgs, sent = [], set()
+    cur, cur_keys, vis = [], set(), 0
+
+    def flush():
+        nonlocal cur, cur_keys, vis
+        msgs.append("\n".join(cur))
+        sent.update(cur_keys)
+        cur, cur_keys, vis = [], set(), 0
+
+    for line, key in items:
+        lv = len(TAG_RE.sub("", line)) + 1
+        if cur and vis + lv > MSG_VISIBLE_LIMIT:
+            flush()
+            if len(msgs) >= MAX_MESSAGES:
+                msgs[-1] += "\n…"
+                return msgs, sent
+            cur, vis = [CONT], len(TAG_RE.sub("", CONT)) + 1
+        cur.append(line)
+        vis += lv
+        if key:
+            cur_keys.add(key)
+    if cur:
+        flush()
+    return msgs, sent
+
+
+def build_insider_message(buys, sells, date, total, filings, failed, broken):
+    """(줄, 키) 목록. 내부자 피드는 상태를 쓰지 않으므로 키는 전부 None."""
     lines = [
         f"<b>🏢 내부자 거래 · Form 4</b> — {date:%Y-%m-%d}",
-        f"<i>신고지연 2영업일 · 원시 {total}건 중 필터 통과분</i>",
-        "",
-        f"<b>매수 (P)</b>  <i>10b5-1 제외 · ≥{money(MIN_BUY_VALUE)}</i>",
+        f"<i>신고지연 2영업일 · 제출 {filings}건 → 매매행 {total}건 중 필터 통과분</i>",
     ]
+    if broken:
+        lines.append(f"<i>⚠️ 제출 {filings}건에서 거래 0건 추출 — 파서 점검 필요</i>")
+    elif failed:
+        lines.append(f"<i>⚠️ 수집 실패 {failed}건은 이번 집계에서 빠짐</i>")
+    lines += ["", f"<b>매수 (P)</b>  <i>10b5-1 제외 · ≥{money(MIN_BUY_VALUE)}</i>"]
     if not buys:
         lines.append("<i>없음</i>")
     for r in buys:
@@ -415,35 +514,51 @@ def build_insider_message(buys, sells, date, total):
         t = f" · {esc(r['title'])}" if r["title"] else ""
         lines.append(f"{tv(r['ticker'])} {money(r['value'])} @ {price(r['price'])} — {who_of(r)}{t}")
 
-    return clamp(lines)
+    return [(ln, None) for ln in lines]
 
 
 def build_congress_message(rows, scanned, since):
-    buys = sorted([r for r in rows if r["type"] == "purchase"], key=lambda r: -r["value"])
-    sells = sorted([r for r in rows if r["type"] == "sale"], key=lambda r: -r["value"])
+    """(줄, 키) 목록. 각 거래 줄에는 그 거래의 상태 키를 붙인다.
 
-    lines = [
-        f"<b>🏛 하원 PTR</b> — {since:%m/%d} 이후 신규 제출",
-        "<i>신고지연 최대 45일 · 금액은 구간 공시(상단 기준 정렬)</i>",
-        "",
+    TOP_N 으로 잘라내지 않는다. 잘린 분까지 발송 완료로 기록되어 영영
+    사라지던 문제 때문이며, 분량은 paginate 가 메시지 분할로 처리한다.
+    """
+    def group(kind):
+        return sorted([r for r in rows if r["type"] == kind], key=lambda r: -r["value"])
+
+    items = [
+        (f"<b>🏛 하원 PTR</b> — {since:%m/%d} 이후 신규 제출", None),
+        ("<i>신고지연 최대 45일 · 금액은 구간 공시(상단 기준 정렬)</i>", None),
+        ("", None),
     ]
-    for label, group in (("매수", buys[:TOP_N]), ("매도", sells[:TOP_N // 2])):
-        lines.append(f"<b>{label}</b>")
-        if not group:
-            lines.append("<i>없음</i>")
-        for r in group:
-            lines.append(
+    # 교환(E)은 드물어 항상 비어 있는 칸을 만들 필요가 없다. 다만 예전처럼
+    # 조용히 버리면 상태에는 기록되고 화면에는 없는 건이 생긴다.
+    for label, kind, always in (("매수", "purchase", True),
+                                ("매도", "sale", True),
+                                ("교환 (E)", "exchange", False)):
+        g = group(kind)
+        if not g and not always:
+            continue
+        items.append((f"<b>{label}</b>", None))
+        if not g:
+            items.append(("<i>없음</i>", None))
+        for r in g:
+            items.append((
                 f'{tv(r["ticker"])} {esc(r["amount"])} — {esc(r["who"])} '
                 f'<i>({esc(r["district"])}, 거래 {esc(r["traded"])})</i> '
-                f'<a href="{r["link"]}">PTR</a>'
-            )
-        lines.append("")
+                f'<a href="{esc(r["link"])}">PTR</a>',
+                r["key"],
+            ))
+        items.append(("", None))
 
     if scanned:
-        lines.append(f"<b>⚠️ 스캔 제출본 {len(scanned)}건</b> <i>(자동 파싱 불가)</i>")
-        for f in scanned[:5]:
-            lines.append(f'· <a href="{f["url"]}">{esc(f["who"])}</a> {f["filed"]:%m/%d}')
-    return clamp(lines)
+        items.append((f"<b>⚠️ 스캔 제출본 {len(scanned)}건</b> <i>(자동 파싱 불가)</i>", None))
+        for f in scanned:
+            items.append((
+                f'· <a href="{esc(f["url"])}">{esc(f["who"])}</a> {f["filed"]:%m/%d}',
+                f["doc_id"],
+            ))
+    return items
 
 
 def send(text):
@@ -457,36 +572,66 @@ def send(text):
         },
         timeout=30,
     )
+    # raise_for_status() 의 예외 메시지에는 요청 URL 이 그대로 들어가고,
+    # 그 URL 에 봇 토큰이 박혀 있다. 상태코드와 본문만 남긴다.
     if not r.ok:
-        print(f"[error] telegram {r.status_code}: {r.text}", file=sys.stderr)
-    r.raise_for_status()
+        raise RuntimeError(f"telegram {r.status_code}: {r.text[:300]}")
 
 
 def run_insider():
     target = _prev_business_day(dt.date.today())
-    rows = aggregate(collect_form4(target))
+    raw, failed, filings = collect_form4(target)
+    rows = aggregate(raw)
     annotate_cluster(rows)
     buys, sells = filter_buys(rows), filter_sells(rows)
-    print(f"form4 target={target} raw={len(rows)} buys={len(buys)} sells={len(sells)}")
-    send(build_insider_message(buys, sells, target, len(rows)))
+
+    broken = filings >= FORM4_ALERT_MIN_FILINGS and not rows
+    print(f"form4 target={target} filings={filings} failed={failed} "
+          f"rows={len(rows)} buys={len(buys)} sells={len(sells)}")
+
+    msgs, _ = paginate(
+        build_insider_message(buys, sells, target, len(rows), filings, failed, broken))
+    for m in msgs:
+        send(m)
+    if broken:
+        raise RuntimeError(f"Form 4 제출 {filings}건에서 거래 0건 추출 — 파서 점검 필요")
 
 
 def run_congress():
     since = dt.date.today() - dt.timedelta(days=CONGRESS_LOOKBACK_DAYS)
-    seen = load_seen()
-    rows, scanned = house_ptr.collect_house(since)
-    fresh = [r for r in filter_congress(rows) if r["key"] not in seen]
-    scanned = [f for f in scanned if f["doc_id"] not in seen]
-    print(f"congress new={len(fresh)} scanned={len(scanned)}")
+    seen, done_docs = load_state()
+    rows, scanned, fetched = house_ptr.collect_house(since, skip_docs=done_docs)
+
+    if len(fetched) >= PTR_ALERT_MIN_DOCS and not rows and not scanned:
+        raise RuntimeError(f"PTR {len(fetched)}건에서 거래 0건 파싱 — 파서 점검 필요")
+
+    eligible = filter_congress(rows)
+    fresh = [r for r in eligible if r["key"] not in seen]
+
+    sent = set()
     if fresh or scanned:
-        send(build_congress_message(fresh, scanned, since))
-        seen.update(r["key"] for r in fresh)
-        seen.update(f["doc_id"] for f in scanned)
-        save_seen(seen)
+        msgs, sent = paginate(build_congress_message(fresh, scanned, since))
+        for m in msgs:
+            send(m)
+    seen |= sent
+    print(f"congress fetched={len(fetched)} new={len(fresh)} "
+          f"scanned={len(scanned)} sent={len(sent)}")
+
+    # 발송이 끝난 문서만 완료 처리한다. 페이지 상한에 걸려 남은 행이 있는
+    # 문서를 완료로 적으면 그 행을 다시는 받아보지 못한다.
+    pending = {r["doc_id"] for r in eligible if r["key"] not in seen}
+    pending |= {f["doc_id"] for f in scanned if f["doc_id"] not in sent}
+    save_state(seen, done_docs | (fetched - pending))
 
 
 def main():
     """두 피드는 서로 독립이다. 한쪽이 실패해도 다른 쪽은 시도한다."""
+    missing = [n for n, v in (("SEC_UA", SEC_UA),
+                              ("TELEGRAM_TOKEN", TG_TOKEN),
+                              ("TELEGRAM_CHAT_ID", TG_CHAT)) if not v]
+    if missing:
+        sys.exit(f"[error] 환경변수 미설정: {', '.join(missing)}")
+
     failed = []
     for name, fn in (("내부자", run_insider), ("하원", run_congress)):
         try:

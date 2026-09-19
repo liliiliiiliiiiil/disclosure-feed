@@ -8,6 +8,9 @@
 
 스캔 제출본(텍스트 레이어 없음)은 OCR 하지 않고 별도로 표시만 한다.
 필기 서식에 대한 OCR 오인식은 티커를 조용히 틀리게 만들어, 누락보다 해롭다.
+
+collect_house 는 이미 처리한 DocID 를 건너뛴다. 조회 창이 7일이고 주 5회
+실행이므로, 건너뛰지 않으면 PTR 한 건을 평균 5회 다시 받아 다시 파싱한다.
 """
 import datetime as dt
 import io
@@ -29,6 +32,9 @@ WORKERS = 4
 RATE = 3.0            # req/sec. 공식 명시 한도는 없으나 보수적으로.
 SCANNED_MIN_CHARS = 400   # 이 미만이면 텍스트 레이어 없음으로 간주
 
+HTTP_RETRIES = 3
+RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+
 _lock = threading.Lock()
 _next = [0.0]
 _local = threading.local()
@@ -43,16 +49,33 @@ def _throttle():
         _next[0] = now + 1.0 / RATE
 
 
-def _get(url, timeout=60):
-    _throttle()
+def _session():
     s = getattr(_local, "s", None)
     if s is None:
         s = requests.Session()
         s.headers["User-Agent"] = UA
         _local.s = s
-    r = s.get(url, timeout=timeout)
-    r.raise_for_status()
-    return r
+    return s
+
+
+def _get(url, timeout=60):
+    """일시적 오류(429/5xx/네트워크)는 지수 백오프로 재시도한다.
+
+    재시도가 없으면 순간 장애 한 번에 해당 PTR 이 통째로 누락되는데,
+    누락된 사실이 어디에도 남지 않아 조용한 결손이 된다.
+    """
+    for attempt in range(HTTP_RETRIES + 1):
+        last = attempt == HTTP_RETRIES
+        _throttle()
+        try:
+            r = _session().get(url, timeout=timeout)
+            if r.status_code not in RETRY_STATUS or last:
+                r.raise_for_status()
+                return r
+        except (requests.ConnectionError, requests.Timeout):
+            if last:
+                raise
+        time.sleep(2 ** attempt)
 
 
 # ---------- 인덱스 ----------
@@ -71,7 +94,7 @@ def index_ptrs(year, since):
     url = f"{BASE}/financial-pdfs/{year}FD.ZIP"
     try:
         blob = _get(url).content
-    except requests.HTTPError as e:
+    except requests.RequestException as e:
         print(f"[warn] {year} 인덱스 실패: {e}", file=sys.stderr)
         return []
 
@@ -134,6 +157,10 @@ def parse_txns(text):
 
     티커가 괄호로 표기된 건만 잡힌다. 지방채/국채/펀드 등 티커 없는 자산은
     의도적으로 버린다 (주식 시그널만 본다).
+
+    금액은 구간 공시라 하단(value_min)과 상단(value)을 모두 남긴다.
+    필터는 "최소 이만큼은 거래했다"가 분명한 하단을, 정렬은 규모 감을 주는
+    상단을 쓴다. 하나로 합치면 둘 중 하나가 반드시 거짓말을 한다.
     """
     rows = []
     for m in TXN_RE.finditer(text):
@@ -148,49 +175,69 @@ def parse_txns(text):
             "notified": notified,
             "amount": re.sub(r"\s+", " ", amt),
             "value": max(nums) if nums else 0.0,
+            "value_min": min(nums) if nums else 0.0,
         })
     return rows
 
 
 def fetch_and_parse(f):
-    """PTR 하나를 받아 파싱. 스캔본이면 scanned=True 로 표시하고 거래는 비운다."""
+    """PTR 하나를 받아 파싱.
+
+    failed=True  수집 실패. 처리 완료로 기록하면 안 된다(다음 실행에서 재시도).
+    scanned=True 텍스트 레이어 없음. 링크로만 보고하고 처리 완료로 본다.
+    """
     try:
         blob = _get(f["url"]).content
-    except requests.HTTPError as e:
+    except requests.RequestException as e:
         print(f"[warn] PDF 실패 {f['doc_id']}: {e}", file=sys.stderr)
-        return f | {"scanned": False, "txns": []}
+        return f | {"failed": True, "scanned": False, "txns": []}
 
     try:
         with pdfplumber.open(io.BytesIO(blob)) as pdf:
             text = "\n".join((p.extract_text() or "") for p in pdf.pages)
     except Exception as e:
         print(f"[warn] 파싱 실패 {f['doc_id']}: {e}", file=sys.stderr)
-        return f | {"scanned": True, "txns": []}
+        return f | {"failed": False, "scanned": True, "txns": []}
 
     if len(text.strip()) < SCANNED_MIN_CHARS:
-        return f | {"scanned": True, "txns": []}
-    return f | {"scanned": False, "txns": parse_txns(text)}
+        return f | {"failed": False, "scanned": True, "txns": []}
+    return f | {"failed": False, "scanned": False, "txns": parse_txns(text)}
 
 
 # ---------- 진입점 ----------
 
-def collect_house(since):
-    """since 이후 제출된 하원 PTR 거래 목록과 스캔본 목록을 반환."""
+def collect_house(since, skip_docs=()):
+    """since 이후 제출된 하원 PTR 을 수집.
+
+    반환: (거래 행, 스캔본, 이번에 실제로 받아 파싱한 DocID 집합)
+
+    skip_docs 에 든 문서는 내려받지 않는다. 호출 측이 "전부 발송 완료된
+    문서"만 여기에 넣어야 한다. 아직 발송되지 않은 행이 남은 문서를 넣으면
+    그 행은 영영 다시 잡히지 않는다.
+    """
     years = {since.year, dt.date.today().year}   # 연초 경계 대응
     filings = []
     for y in sorted(years):
         filings.extend(index_ptrs(y, since))
-    print(f"[info] 하원 PTR {len(filings)}건 인덱싱", file=sys.stderr)
 
-    rows, scanned = [], []
+    total = len(filings)
+    filings = [f for f in filings if f["doc_id"] not in skip_docs]
+    print(f"[info] 하원 PTR {total}건 인덱싱 (신규 {len(filings)}건, "
+          f"처리완료 {total - len(filings)}건 건너뜀)", file=sys.stderr)
+
+    rows, scanned, fetched = [], [], set()
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         for f in ex.map(fetch_and_parse, filings):
+            if f["failed"]:
+                continue
+            fetched.add(f["doc_id"])
             if f["scanned"]:
                 scanned.append(f)
                 continue
             for t in f["txns"]:
                 rows.append({
                     "chamber": "House",
+                    "doc_id": f["doc_id"],
                     "who": f["who"],
                     "district": f["district"],
                     "filed": f["filed"],
@@ -198,5 +245,6 @@ def collect_house(since):
                     "key": f"{f['doc_id']}|{t['ticker']}|{t['type']}|{t['traded']}|{t['amount']}",
                     **t,
                 })
-    print(f"[info] 거래 {len(rows)}건 / 스캔본 {len(scanned)}건", file=sys.stderr)
-    return rows, scanned
+    print(f"[info] 거래 {len(rows)}건 / 스캔본 {len(scanned)}건 / "
+          f"수집실패 {len(filings) - len(fetched)}건", file=sys.stderr)
+    return rows, scanned, fetched
