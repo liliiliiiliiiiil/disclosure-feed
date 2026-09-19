@@ -1,4 +1,4 @@
-# 임시 탐색용. 티커 -> CIK 소스 두 개의 커버리지를 비교한다. 확인 후 삭제.
+# 임시 검증용. 교차참조 전체 사슬을 실제 데이터로 돌린다. 확인 후 삭제.
 name: probe-sic
 
 on:
@@ -7,50 +7,51 @@ on:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
-      - run: pip install requests
+      - run: pip install -r requirements.txt
       - run: |
           python - <<'PY'
-          import os, requests
-          s = requests.Session()
-          s.headers["User-Agent"] = os.environ["SEC_UA"]
+          import datetime as dt
+          import insider_feed as f
+          import senate_efd, house_ptr, committee_overlap
 
-          def load(url, shape):
-              r = s.get(url, timeout=60); r.raise_for_status()
-              j = r.json()
-              if shape == "dict":
-                  d = {v["ticker"].upper(): v["cik_str"] for v in j.values()}
-              else:
-                  cols = [c.lower() for c in j["fields"]]
-                  ti, ci = cols.index("ticker"), cols.index("cik")
-                  d = {row[ti].upper(): row[ci] for row in j["data"] if row[ti]}
-              print(f"{url.rsplit('/',1)[-1]:<34} {len(r.content)/1e6:>5.1f}MB  티커 {len(d):,}", flush=True)
-              return d
+          since = dt.date.today() - dt.timedelta(days=30)
+          rows, scanned, fetched = senate_efd.collect_senate(since)
+          hrows, hscanned, hfetched = house_ptr.collect_house(since)
+          rows += hrows
+          print(f"\n총 거래 {len(rows)}건 (상원 {len(rows)-len(hrows)} / 하원 {len(hrows)})", flush=True)
 
-          a = load("https://www.sec.gov/files/company_tickers.json", "dict")
-          b = load("https://www.sec.gov/files/company_tickers_exchange.json", "table")
+          eligible = f.filter_congress(rows)
+          print(f"필터 통과 {len(eligible)}건", flush=True)
 
-          # 실제 피드에 등장한 티커 + 의회 거래에 흔한 대형주
-          REAL = ["WMB","EA","AVB","JNJ","CEG","OTIS","IVV","IJR","AVUV","SPYM","WWSYX"]
-          COMMON = ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","JPM","BAC","LMT",
-                    "RTX","NOC","GD","BA","PFE","MRK","ABBV","UNH","CVX","XOM","COP",
-                    "NEE","DUK","SO","T","VZ","TMUS","DE","ADM","TSN","PLD","AMT","SPG"]
-          print(flush=True)
-          for label, ts in (("실측 등장", REAL), ("흔한 대형주", COMMON)):
-              ma = [t for t in ts if t in a]
-              mb = [t for t in ts if t in b]
-              print(f"[{label}] n={len(ts)}  company_tickers={len(ma)}  exchange={len(mb)}", flush=True)
-              print(f"   company_tickers 누락: {sorted(set(ts)-set(ma))}", flush=True)
-              print(f"   exchange 누락:        {sorted(set(ts)-set(mb))}", flush=True)
+          sic = {}
+          f.annotate_overlap(eligible, sic)
+          print(f"SIC 캐시 {len(sic)}개 확보", flush=True)
 
-          only_b = set(b) - set(a)
-          print(f"\nexchange 에만 있는 티커 수: {len(only_b):,}", flush=True)
-          print(f"둘의 합집합: {len(set(a)|set(b)):,}", flush=True)
+          hit = [r for r in eligible if r.get("overlap")]
+          print(f"\n=== 교차참조 적중 {len(hit)}/{len(eligible)} ===", flush=True)
+          for r in hit:
+              ov = " · ".join(f"{l}{'★' if c else ''}" for l, c in r["overlap"])
+              print(f"  {r['ticker']:<6} {r['type']:<9} {r['who']:<26} "
+                    f"sic={sic.get(r['ticker'],''):<5} ⚖️ {ov}", flush=True)
+
+          print("\n=== 업종은 알지만 안 겹친 건 (상위 12) ===", flush=True)
+          n = 0
+          for r in eligible:
+              s = committee_overlap.sector_of_sic(sic.get(r["ticker"], ""))
+              if s and not r.get("overlap"):
+                  print(f"  {r['ticker']:<6} {s:<12} {r['who']}", flush=True)
+                  n += 1
+                  if n >= 12:
+                      break
+
+          unresolved = sorted({r["ticker"] for r in eligible if not sic.get(r["ticker"])})
+          print(f"\n업종 판정 불가 티커 {len(unresolved)}개: {unresolved[:25]}", flush=True)
           PY
         env:
           SEC_UA: ${{ secrets.SEC_UA }}

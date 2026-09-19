@@ -27,6 +27,7 @@ import requests
 
 import house_ptr
 import senate_efd
+import committee_overlap
 
 # import 시점에 죽으면 테스트조차 불러올 수 없어 여기서는 읽기만 하고,
 # 실제 유효성은 main() 에서 한 번에 확인한다.
@@ -412,7 +413,7 @@ def _dry_map(v):
 
 
 def load_state():
-    """(발송 완료 거래, 처리 완료 PTR 문서, 원별 연속 헛파싱 문서 수).
+    """(발송 완료 거래, 처리 완료 PTR 문서, 원별 연속 헛파싱 수, 티커별 SIC).
 
     구버전은 평면 키 목록이었으므로 그 형태도 읽는다.
     """
@@ -420,22 +421,25 @@ def load_state():
         with open(STATE_PATH) as f:
             data = json.load(f)
     except (OSError, ValueError):
-        return set(), set(), _dry_map(None)
+        return set(), set(), _dry_map(None), {}
     if isinstance(data, list):
-        return set(data), set(), _dry_map(None)
+        return set(data), set(), _dry_map(None), {}
     return (set(data.get("keys", ())),
             set(data.get("docs", ())),
-            _dry_map(data.get("dry")))
+            _dry_map(data.get("dry")),
+            dict(data.get("sic") or {}))
 
 
-def save_state(keys, docs, dry):
+def save_state(keys, docs, dry, sic=None):
     d = os.path.dirname(STATE_PATH)
     if d:
         os.makedirs(d, exist_ok=True)
     with open(STATE_PATH, "w") as f:                      # 무한 증가 방지
         json.dump({"keys": sorted(keys)[-50_000:],
                    "docs": sorted(docs)[-50_000:],
-                   "dry": _dry_map(dry)}, f)
+                   "dry": _dry_map(dry),
+                   # 티커의 SIC 는 바뀌지 않으므로 한 번 찾으면 계속 쓴다.
+                   "sic": dict(sorted((sic or {}).items()))}, f)
 
 
 def dry_streak(prev, parsed, found):
@@ -565,6 +569,8 @@ def build_congress_message(rows, scanned, since, broken=None):
         (f"<b>🏛 의회 PTR</b> — {since:%m/%d} 이후 신규 제출", None),
         ("<i>하원·상원 · 신고지연 최대 45일 · 금액은 구간 공시(상단 기준 정렬)</i>", None),
     ]
+    if any(r.get("overlap") for r in rows):
+        items.append(("<i>⚖️ = 그 의원이 소관하는 업종 (★ 위원장)</i>", None))
     for n, v in sorted((broken or {}).items()):
         items.append(
             (f"<i>⚠️ {CHAMBERS[n]} PTR {v}건 연속 거래 0건 — 파서 점검 필요</i>", None))
@@ -581,8 +587,11 @@ def build_congress_message(rows, scanned, since, broken=None):
         if not g:
             items.append(("<i>없음</i>", None))
         for r in g:
+            ov = " · ".join(f"{label}{'★' if chair else ''}"
+                            for label, chair in r.get("overlap") or ())
             items.append((
-                f'{tv(r["ticker"])} {esc(r["amount"])} — {esc(r["who"])} '
+                f'{tv(r["ticker"])} {esc(r["amount"])}'
+                f'{" ⚖️ " + esc(ov) if ov else ""} — {esc(r["who"])} '
                 f'<i>({esc(r["district"] or r["chamber"])}, 거래 {esc(r["traded"])})</i> '
                 f'<a href="{esc(r["link"])}">PTR</a>',
                 r["key"],
@@ -635,13 +644,31 @@ def run_insider():
         raise RuntimeError(f"Form 4 제출 {filings}건에서 거래 0건 추출 — 파서 점검 필요")
 
 
+def annotate_overlap(rows, sic):
+    """소관 위원회와 거래 업종의 겹침을 표시.
+
+    본문이 아니라 주석이므로, 조회가 실패해도 공시는 그대로 보낸다.
+    """
+    for r in rows:
+        r["overlap"] = []
+    if not rows:
+        return
+    try:
+        members = committee_overlap.load_members(_get)
+        sectors = committee_overlap.sector_lookup(
+            {r["ticker"] for r in rows}, _get, sic)
+        committee_overlap.annotate(rows, members, sectors)
+    except Exception as e:
+        print(f"[warn] 위원회 교차참조 건너뜀: {e!r}", file=sys.stderr)
+
+
 COLLECTORS = (("house", house_ptr.collect_house),
               ("senate", senate_efd.collect_senate))
 
 
 def run_congress():
     since = dt.date.today() - dt.timedelta(days=CONGRESS_LOOKBACK_DAYS)
-    seen, done_docs, dry = load_state()
+    seen, done_docs, dry, sic = load_state()
 
     rows, scanned, fetched, failed = [], [], set(), []
     for name, collect in COLLECTORS:
@@ -663,6 +690,8 @@ def run_congress():
     eligible = filter_congress(rows)
     fresh = [r for r in eligible if r["key"] not in seen]
 
+    annotate_overlap(fresh, sic)
+
     sent = set()
     if fresh or scanned or broken:
         msgs, sent = paginate(build_congress_message(fresh, scanned, since, broken))
@@ -670,7 +699,8 @@ def run_congress():
             send(m)
     seen |= sent
     print(f"congress fetched={len(fetched)} new={len(fresh)} "
-          f"scanned={len(scanned)} sent={len(sent)} dry={dry}")
+          f"scanned={len(scanned)} sent={len(sent)} dry={dry} "
+          f"overlap={sum(1 for r in fresh if r.get('overlap'))}")
 
     # 발송이 끝난 문서만 완료 처리한다. 페이지 상한에 걸려 남은 행이 있는
     # 문서를 완료로 적으면 그 행을 다시는 받아보지 못한다.
@@ -678,7 +708,7 @@ def run_congress():
     pending |= {f["doc_id"] for f in scanned if f["doc_id"] not in sent}
     # 카운터는 예외보다 먼저 저장한다. 저장 전에 죽으면 다음 실행이 같은
     # 자리에서 다시 세기 시작해 경보가 영영 오지 않는다.
-    save_state(seen, done_docs | (fetched - pending), dry)
+    save_state(seen, done_docs | (fetched - pending), dry, sic)
 
     if broken:
         raise RuntimeError("PTR 연속 파싱 0건 — " + ", ".join(

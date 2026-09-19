@@ -245,20 +245,21 @@ class State(unittest.TestCase):
         f.STATE_PATH = self.orig
 
     def test_round_trip(self):
-        f.save_state({"k1", "k2"}, {"d1"}, {"house": 7, "senate": 3})
+        f.save_state({"k1", "k2"}, {"d1"}, {"house": 7, "senate": 3}, {"AAPL": "3571"})
         self.assertEqual(f.load_state(),
-                         ({"k1", "k2"}, {"d1"}, {"house": 7, "senate": 3}))
+                         ({"k1", "k2"}, {"d1"}, {"house": 7, "senate": 3},
+                          {"AAPL": "3571"}))
 
     def test_reads_legacy_flat_list(self):
         with open(f.STATE_PATH, "w") as fh:
             json.dump(["k1", "k2"], fh)
         self.assertEqual(f.load_state(),
-                         ({"k1", "k2"}, set(), {"house": 0, "senate": 0}))
+                         ({"k1", "k2"}, set(), {"house": 0, "senate": 0}, {}))
 
     def test_reads_state_written_before_the_counter_existed(self):
         with open(f.STATE_PATH, "w") as fh:
             json.dump({"keys": ["k1"], "docs": ["d1"]}, fh)
-        self.assertEqual(f.load_state(), ({"k1"}, {"d1"}, {"house": 0, "senate": 0}))
+        self.assertEqual(f.load_state(), ({"k1"}, {"d1"}, {"house": 0, "senate": 0}, {}))
 
     def test_reads_counter_from_before_the_senate_was_added(self):
         # 당시 dry 는 하원 하나뿐이라 정수였다.
@@ -268,7 +269,7 @@ class State(unittest.TestCase):
 
     def test_missing_file(self):
         f.STATE_PATH = os.path.join(self.tmp, "nope", "seen.json")
-        self.assertEqual(f.load_state(), (set(), set(), {"house": 0, "senate": 0}))
+        self.assertEqual(f.load_state(), (set(), set(), {"house": 0, "senate": 0}, {}))
 
 
 class DryStreak(unittest.TestCase):
@@ -300,13 +301,16 @@ class CongressAlert(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.orig_path, self.orig_send = f.STATE_PATH, f.send
         self.orig_collectors = f.COLLECTORS
+        self.orig_annotate = f.annotate_overlap
         f.STATE_PATH = os.path.join(self.tmp, "seen.json")
         self.sent = []
         f.send = self.sent.append
+        f.annotate_overlap = lambda rows, sic: [r.update(overlap=[]) for r in rows]
 
     def tearDown(self):
         f.STATE_PATH, f.send = self.orig_path, self.orig_send
         f.COLLECTORS = self.orig_collectors
+        f.annotate_overlap = self.orig_annotate
 
     def feed(self, docs=(), rows=(), senate=None):
         """두 수집기를 모두 대체한다. 하나라도 빠뜨리면 실제 EFD 를 때린다."""
@@ -358,6 +362,20 @@ class CongressAlert(unittest.TestCase):
             f.run_congress()
         self.assertIn("수집 실패", str(cm.exception))
         # 하원 공시는 그래도 나갔어야 한다.
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("AAPL", self.sent[0])
+
+    def test_overlap_failure_does_not_stop_the_digest(self):
+        # 교차참조는 본문이 아니라 주석이다. 소스가 죽어도 공시는 가야 한다.
+        f.annotate_overlap = self.orig_annotate
+        orig = f.committee_overlap.load_members
+        f.committee_overlap.load_members = lambda get: (_ for _ in ()).throw(
+            RuntimeError("legislators 소스 다운"))
+        try:
+            self.feed({"h1"}, rows=[_congress_row("h1")])
+            f.run_congress()
+        finally:
+            f.committee_overlap.load_members = orig
         self.assertEqual(len(self.sent), 1)
         self.assertIn("AAPL", self.sent[0])
 

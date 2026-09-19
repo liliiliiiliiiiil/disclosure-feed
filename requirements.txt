@@ -1,5 +1,7 @@
+# committee_overlap 은 congress-legislators 의 YAML 을 읽는다.
 # PTR 파싱은 pdfminer 의 텍스트 추출 동작(깨진 ToUnicode 매핑에도 거래 행은
 # 정상 추출된다는 성질)에 기대고 있다. 버전을 풀어두면 업스트림 업데이트
 # 한 번에 파싱 결과가 조용히 바뀐다.
 requests==2.33.1
 pdfplumber==0.11.10
+pyyaml==6.0.3
