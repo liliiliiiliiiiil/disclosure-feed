@@ -49,6 +49,7 @@ Thresholds live at the top of `insider_feed.py`.
 insider_feed.py                      Entry point, Form 4 collection, Telegram
 house_ptr.py                         House PTR collection (imported module)
 senate_efd.py                        Senate PTR collection (imported module)
+committee_overlap.py                 Committee jurisdiction vs traded sector
 requirements.txt                     Pinned deps (PDF text extraction is
                                      sensitive to the pdfminer version)
 tests/                               Fixture-based tests, no network needed
@@ -145,15 +146,43 @@ left unrecorded and picked up on the next run.
   living under `/search/view/paper/` — and reported as a link only. OCR is
   intentionally not used: these forms are largely handwritten, and a
   misrecognized ticker is worse than a missing one.
-- **Committee assignments are not cross-referenced.** The strongest signal in
-  congressional trading is the overlap between a member's committee jurisdiction
-  and the sector they traded. That mapping is not implemented yet.
 - **Amended PTRs are reported twice.** An amendment gets its own DocID and the
   Clerk index does not link it back to the filing it corrects, so both the
   original and the amendment come through as separate entries.
 - The 10b5-1 flag only exists on filings made after the December 2022 rule
   change. Older filings fall through as unflagged, which means "undetermined"
   rather than "not a planned trade".
+
+## Committee cross-reference
+
+A congressional row is marked when the member sits on a committee whose
+jurisdiction covers the sector of what they traded — the closest this data gets
+to a conflict of interest. Three lookups stand behind the mark: the filer
+resolves to a legislator and their committees through
+[congress-legislators](https://github.com/unitedstates/congress-legislators),
+and the ticker resolves to an SIC code through SEC's ticker list and
+submissions data. SIC codes are cached in state, since a company's code does
+not change.
+
+The committee-to-sector table in `committee_overlap.py` is the one piece of
+this project that is judgement rather than fact, because no official mapping
+exists. It is deliberately narrow. Committees whose reach is universal — Ways
+and Means, Senate Finance, Appropriations, Budget, Judiciary — are left out on
+purpose: include them and nearly every trade earns a mark, which makes the mark
+worthless. Sector codes are read narrowly for the same reason. An early version
+mapped whole SIC divisions and promptly flagged a pump manufacturer and a
+surgical-instrument maker as within the Science Committee's jurisdiction.
+
+Anything that cannot be resolved goes unmarked rather than guessed: a surname
+that matches two members, a ticker SEC does not list, an SIC code with no
+mapping. A wrong mark is worse than a missing one. The cross-reference is an
+annotation rather than the data, so if either source is unreachable the digest
+still goes out, just unmarked.
+
+SEC's ticker list happens to carry no ETFs or mutual funds, so index-fund
+purchases fall out of sector matching without needing a rule. It also misses
+some real operating companies — EA and AVB among them — which simply go
+unmarked.
 
 ## Failure handling
 
@@ -190,6 +219,9 @@ The two feeds are independent: one failing does not stop the other.
 - Office of the Clerk, U.S. House of Representatives, Financial Disclosure
   Reports — <https://disclosures-clerk.house.gov>
 - U.S. Senate, Electronic Financial Disclosure — <https://efdsearch.senate.gov>
+- SEC company ticker and submissions data — <https://data.sec.gov>
+- Committee assignments from the public-domain `unitedstates/congress-legislators`
+  dataset — <https://github.com/unitedstates/congress-legislators>
 
 Both are public domain U.S. government records. This project stores no data
 beyond a list of already-seen filing identifiers.

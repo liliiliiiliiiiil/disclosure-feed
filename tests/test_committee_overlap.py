@@ -45,7 +45,9 @@ class SicSectors(unittest.TestCase):
     def test_longest_prefix_wins(self):
         # 3812 는 방산, 38 일반은 tech
         self.assertEqual(co.sector_of_sic("3812"), "defense")
-        self.assertEqual(co.sector_of_sic("3826"), "tech")
+        # 38 대분류를 통째로 tech 로 보면 안 된다(실측 오탐의 원인).
+        self.assertEqual(co.sector_of_sic("3826"), "")
+        self.assertEqual(co.sector_of_sic("3842"), "health")
         # 6324 는 건강보험이라 finance 가 아니라 health
         self.assertEqual(co.sector_of_sic("6324"), "health")
         self.assertEqual(co.sector_of_sic("6311"), "finance")
@@ -58,6 +60,13 @@ class SicSectors(unittest.TestCase):
         for sic, want in (("2834", "pharma"), ("3674", "tech"), ("3760", "defense"),
                           ("6021", "finance"), ("6798", "realestate")):
             self.assertEqual(co.sector_of_sic(sic), want, sic)
+
+    def test_industrial_machinery_is_not_tech(self):
+        # 실측 오탐: 3561 펌프 제조사가 과학기술위 관할로 잡혔었다.
+        self.assertEqual(co.sector_of_sic("3561"), "")
+        self.assertEqual(co.sector_of_sic("3600"), "")   # 엘리베이터 등
+        self.assertEqual(co.sector_of_sic("3571"), "tech")
+        self.assertEqual(co.sector_of_sic("3674"), "tech")
 
     def test_unknown_is_empty(self):
         self.assertEqual(co.sector_of_sic(""), "")
