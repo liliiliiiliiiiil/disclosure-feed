@@ -7,7 +7,12 @@ because the underlying filings have very different reporting lag and precision.
 | Feed | Source | Reporting lag | Amount precision |
 |---|---|---|---|
 | Corporate insiders | SEC EDGAR, Form 4 | 2 business days | Exact (shares x price) |
-| U.S. House members | House Clerk, PTR | Up to 45 days | Bracketed range |
+| Congress | House Clerk and Senate EFD, PTR | Up to 45 days | Bracketed range |
+
+Both chambers file the same kind of report on the same terms, so they share one
+message, one set of thresholds and one deduplication state. Only the collection
+differs: the House publishes a yearly ZIP of PDFs, the Senate a search behind a
+click-through agreement.
 
 Runs on GitHub Actions Tuesday through Saturday. The cron asks for 05:30 UTC,
 but GitHub's scheduler has consistently fired it about four hours late, so the
@@ -43,6 +48,7 @@ Thresholds live at the top of `insider_feed.py`.
 .github/workflows/tests.yml          Parser regression tests on every push
 insider_feed.py                      Entry point, Form 4 collection, Telegram
 house_ptr.py                         House PTR collection (imported module)
+senate_efd.py                        Senate PTR collection (imported module)
 requirements.txt                     Pinned deps (PDF text extraction is
                                      sensitive to the pdfminer version)
 tests/                               Fixture-based tests, no network needed
@@ -106,6 +112,21 @@ mangle letter case, which is normalized on extraction.
 Only assets with a parenthesized ticker are captured. Municipal bonds, treasury
 notes, and unlisted funds are deliberately dropped.
 
+## How Senate PTRs are collected
+
+The Senate has no bulk archive. Its search answers only after a session accepts
+the prohibition agreement, so each run fetches the agreement form, posts it back
+with the CSRF token, then queries report type 11 over the reporting window. The
+reports themselves are HTML tables rather than PDFs, so no text extraction is
+needed.
+
+The table gives a ticker in its own column, but it is often `--` even when the
+asset name carries a symbol, so the name is read as a fallback. That fallback
+gives up when it finds more than one distinct symbol: exchanges name both the
+security given up and the one received on a single line, and there is no way to
+tell from the row which side the transaction was on. Guessing there would put a
+wrong ticker in the digest, which is worse than dropping the row.
+
 Amounts are disclosed as a bracket, so both ends are kept. The filter uses the
 **lower** bound, since that is the number the filing actually guarantees, and
 `CONGRESS_MIN_AMOUNT` is $15,000 — the $15,001-$50,000 bracket is the smallest
@@ -119,11 +140,9 @@ left unrecorded and picked up on the next run.
 
 ## Known limitations
 
-- **Senate filings are not included.** The Senate EFD search requires accepting
-  an interstitial agreement and carrying a CSRF token, which needs a separate
-  fetcher. The House is roughly four times the volume.
-- **Scanned PTRs are not parsed.** Some members still file on paper. These are
-  detected by the absence of a text layer and reported as a link only. OCR is
+- **Scanned and paper PTRs are not parsed.** Some members still file on paper. These are
+  detected by the absence of a text layer — or, in the Senate, by the filing
+  living under `/search/view/paper/` — and reported as a link only. OCR is
   intentionally not used: these forms are largely handwritten, and a
   misrecognized ticker is worse than a missing one.
 - **Committee assignments are not cross-referenced.** The strongest signal in
@@ -170,14 +189,17 @@ The two feeds are independent: one failing does not stop the other.
 - SEC EDGAR full-text filing archive — <https://www.sec.gov/edgar>
 - Office of the Clerk, U.S. House of Representatives, Financial Disclosure
   Reports — <https://disclosures-clerk.house.gov>
+- U.S. Senate, Electronic Financial Disclosure — <https://efdsearch.senate.gov>
 
 Both are public domain U.S. government records. This project stores no data
 beyond a list of already-seen filing identifiers.
 
-House financial disclosure records carry statutory restrictions on use under
-the Ethics in Government Act, including prohibitions on use for credit rating,
-solicitation, and other unlawful purposes. This project is intended for personal
-research and transparency only.
+Congressional financial disclosure records carry statutory restrictions on use
+under the Ethics in Government Act, including prohibitions on use for credit
+rating, solicitation, and other unlawful purposes. The Senate states these in a
+click-through agreement that has to be accepted before its search will answer;
+`senate_efd.py` accepts it on each run. This project is intended for personal
+research and transparency only, which is within those restrictions.
 
 ## Disclaimer
 
