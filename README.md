@@ -46,8 +46,9 @@ tests/                               Fixture-based tests, no network needed
 
 `.state/seen.json` is created at runtime to suppress duplicate House filings
 across runs. It is restored and saved by `actions/cache` and is not committed.
-It holds two sets: `keys` for transactions already sent, and `docs` for PTR
-documents already fully processed. The second one is what stops a PTR from
+It holds `keys` for transactions already sent, `docs` for PTR documents already
+fully processed, and `dry`, the parser-health streak described under Failure
+handling. The second one is what stops a PTR from
 being re-downloaded on all five runs of its seven-day window. A document is
 only recorded once everything it contributed has actually been delivered, so
 nothing is lost to a truncated digest.
@@ -138,9 +139,25 @@ times with exponential backoff. A filing that still cannot be fetched is
 counted rather than dropped silently, and the count appears in the digest.
 
 Format changes at the source would otherwise produce an empty digest that looks
-exactly like a quiet day. If a run sees at least 100 Form 4 filings and extracts
-no transactions at all — or fetches at least 20 PTRs and parses none — it says
-so in the message and exits non-zero, which turns the Actions run red.
+exactly like a quiet day. Both feeds watch for that, but they need different
+tests, because Form 4 arrives in the hundreds daily while the House files fewer
+than ten PTRs in a week.
+
+For Form 4, one run is enough: at least 100 filings with no transactions
+extracted is a broken parser.
+
+For the House, a single run proving nothing — plenty of PTRs hold only
+municipal bonds, treasuries, or unlisted funds, and yield no rows at all — the
+count accumulates across runs instead. Every PTR that is fetched and has a text
+layer adds to a streak; any transaction found anywhere resets it to zero.
+Thirty consecutive documents with nothing in them is treated as a break.
+Scanned filings are excluded, since parsing nothing out of them is the expected
+outcome, and a run that had no new documents to fetch leaves the streak
+untouched rather than counting as evidence either way.
+
+Either test firing puts a warning at the top of the message and exits non-zero,
+which turns the Actions run red. The streak is written to state before the
+error is raised, so the count keeps climbing instead of restarting each run.
 
 The two feeds are independent: one failing does not stop the other.
 

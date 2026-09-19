@@ -236,17 +236,99 @@ class State(unittest.TestCase):
         f.STATE_PATH = self.orig
 
     def test_round_trip(self):
-        f.save_state({"k1", "k2"}, {"d1"})
-        self.assertEqual(f.load_state(), ({"k1", "k2"}, {"d1"}))
+        f.save_state({"k1", "k2"}, {"d1"}, 7)
+        self.assertEqual(f.load_state(), ({"k1", "k2"}, {"d1"}, 7))
 
     def test_reads_legacy_flat_list(self):
         with open(f.STATE_PATH, "w") as fh:
             json.dump(["k1", "k2"], fh)
-        self.assertEqual(f.load_state(), ({"k1", "k2"}, set()))
+        self.assertEqual(f.load_state(), ({"k1", "k2"}, set(), 0))
+
+    def test_reads_state_written_before_the_counter_existed(self):
+        with open(f.STATE_PATH, "w") as fh:
+            json.dump({"keys": ["k1"], "docs": ["d1"]}, fh)
+        self.assertEqual(f.load_state(), ({"k1"}, {"d1"}, 0))
 
     def test_missing_file(self):
         f.STATE_PATH = os.path.join(self.tmp, "nope", "seen.json")
-        self.assertEqual(f.load_state(), (set(), set()))
+        self.assertEqual(f.load_state(), (set(), set(), 0))
+
+
+class DryStreak(unittest.TestCase):
+    """하원 PTR 파서 붕괴 감지: 실행이 아니라 문서를 누적해서 센다."""
+
+    def test_accumulates_across_runs(self):
+        streak = 0
+        for parsed in (2, 3, 1):          # 실행마다 신규 문서 몇 건씩
+            streak = f.dry_streak(streak, parsed, 0)
+        self.assertEqual(streak, 6)
+
+    def test_any_transaction_resets(self):
+        self.assertEqual(f.dry_streak(29, 4, 1), 0)
+
+    def test_run_with_no_new_documents_is_not_evidence(self):
+        # 전부 처리 완료라 파싱한 문서가 없는 실행은 값을 바꾸지 않는다.
+        self.assertEqual(f.dry_streak(12, 0, 0), 12)
+
+    def test_scanned_only_run_does_not_accumulate(self):
+        # run_congress 는 parsed 를 fetched - scanned 로 넘긴다.
+        fetched, scanned = 5, 5
+        self.assertEqual(f.dry_streak(3, fetched - scanned, 0), 3)
+
+
+class CongressAlert(unittest.TestCase):
+    """경보가 텔레그램으로 나가고, 종료코드도 실패로 남는지."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.orig_path, self.orig_send = f.STATE_PATH, f.send
+        self.orig_collect = f.house_ptr.collect_house
+        f.STATE_PATH = os.path.join(self.tmp, "seen.json")
+        self.sent = []
+        f.send = self.sent.append
+
+    def tearDown(self):
+        f.STATE_PATH, f.send = self.orig_path, self.orig_send
+        f.house_ptr.collect_house = self.orig_collect
+
+    def feed(self, docs, rows=()):
+        f.house_ptr.collect_house = lambda since, skip_docs=(): (
+            [r for r in rows], [], {d for d in docs if d not in skip_docs})
+
+    def test_alerts_only_after_the_threshold(self):
+        # 문턱 직전까지는 조용하다.
+        f.save_state(set(), set(), f.PTR_DRY_DOCS_ALERT - 2)
+        self.feed({"a"})
+        f.run_congress()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(f.load_state()[2], f.PTR_DRY_DOCS_ALERT - 1)
+
+        # 한 건 더 헛파싱하면 경보가 나가고 실행도 실패로 끝난다.
+        self.feed({"b"})
+        with self.assertRaises(RuntimeError):
+            f.run_congress()
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("파서 점검 필요", self.sent[0])
+
+    def test_counter_survives_the_raised_alert(self):
+        # 경보 예외보다 먼저 저장되지 않으면 카운터가 제자리걸음을 한다.
+        f.save_state(set(), set(), f.PTR_DRY_DOCS_ALERT)
+        self.feed({"a"})
+        with self.assertRaises(RuntimeError):
+            f.run_congress()
+        self.assertEqual(f.load_state()[2], f.PTR_DRY_DOCS_ALERT + 1)
+
+    def test_healthy_run_stays_quiet_and_resets(self):
+        f.save_state(set(), set(), f.PTR_DRY_DOCS_ALERT - 1)
+        self.feed({"a"}, rows=[{
+            "doc_id": "a", "key": "a|AAPL|purchase", "ticker": "AAPL",
+            "type": "purchase", "amount": "$50,001 - $100,000", "value": 100_000.0,
+            "value_min": 50_001.0, "who": "Rep A", "district": "CA01",
+            "traded": "01/02/2025", "link": "http://x/a.pdf"}])
+        f.run_congress()
+        self.assertEqual(f.load_state()[2], 0)
+        self.assertEqual(len(self.sent), 1)
+        self.assertNotIn("파서 점검 필요", self.sent[0])
 
 
 class Format(unittest.TestCase):

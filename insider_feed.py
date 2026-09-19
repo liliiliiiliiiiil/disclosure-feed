@@ -56,9 +56,18 @@ RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 
 # --- 이상 감지 ---
 # 소스 포맷이 바뀌면 파싱 결과가 0건이 되는데, 그대로 두면 "조용한 날"과
-# "고장 난 날"이 구분되지 않는다. 표본이 충분한데 0건이면 고장으로 본다.
+# "고장 난 날"이 구분되지 않는다.
+#
+# Form 4 는 하루 수백 건이 들어와 한 번의 실행만으로 판단할 수 있다.
 FORM4_ALERT_MIN_FILINGS = 100
-PTR_ALERT_MIN_DOCS = 20
+#
+# 하원 PTR 은 주간 물량이 10건 안팎이라 같은 방식이 통하지 않는다. 티커 없는
+# 자산(지방채·국채·펀드)만 든 신고가 흔해서 한 번의 실행에서 거래 0건은 정상이고,
+# 실행 단위로 세면 오탐이 난다. 그래서 실행이 아니라 문서를 누적해서 센다:
+# 텍스트 레이어가 있는 PTR 을 연속 이만큼 파싱하고도 거래가 하나도 안 나오면
+# 고장으로 본다. 스캔본은 거래가 안 나오는 게 정상이라 세지 않는다.
+# 관측상 PTR 여러 건 중 하나 꼴로는 거래가 나오므로, 30건 연속 0은 사실상 고장이다.
+PTR_DRY_DOCS_ALERT = 30
 
 
 # ---------- HTTP ----------
@@ -391,7 +400,7 @@ def filter_congress(rows):
 # ---------- 중복 발송 방지 ----------
 
 def load_state():
-    """{"keys": 발송 완료 거래, "docs": 처리 완료 PTR 문서}.
+    """(발송 완료 거래, 처리 완료 PTR 문서, 연속 헛파싱 문서 수).
 
     구버전은 평면 키 목록이었으므로 그 형태도 읽는다.
     """
@@ -399,19 +408,32 @@ def load_state():
         with open(STATE_PATH) as f:
             data = json.load(f)
     except (OSError, ValueError):
-        return set(), set()
+        return set(), set(), 0
     if isinstance(data, list):
-        return set(data), set()
-    return set(data.get("keys", ())), set(data.get("docs", ()))
+        return set(data), set(), 0
+    return (set(data.get("keys", ())),
+            set(data.get("docs", ())),
+            int(data.get("dry", 0)))
 
 
-def save_state(keys, docs):
+def save_state(keys, docs, dry):
     d = os.path.dirname(STATE_PATH)
     if d:
         os.makedirs(d, exist_ok=True)
     with open(STATE_PATH, "w") as f:                      # 무한 증가 방지
         json.dump({"keys": sorted(keys)[-50_000:],
-                   "docs": sorted(docs)[-50_000:]}, f)
+                   "docs": sorted(docs)[-50_000:],
+                   "dry": dry}, f)
+
+
+def dry_streak(prev, parsed, found):
+    """연속 헛파싱 문서 수를 갱신한다.
+
+    parsed 는 이번에 텍스트 레이어를 가지고 파싱된 PTR 수, found 는 그로부터
+    나온 거래 수. 거래가 하나라도 나오면 파서는 살아 있으므로 0 으로 리셋한다.
+    처리할 새 문서가 없던 실행(parsed=0)은 증거가 아니므로 값을 그대로 둔다.
+    """
+    return 0 if found else prev + parsed
 
 
 # ---------- 출력 ----------
@@ -516,11 +538,13 @@ def build_insider_message(buys, sells, date, total, filings, failed, broken):
     return [(ln, None) for ln in lines]
 
 
-def build_congress_message(rows, scanned, since):
+def build_congress_message(rows, scanned, since, dry=0):
     """(줄, 키) 목록. 각 거래 줄에는 그 거래의 상태 키를 붙인다.
 
     TOP_N 으로 잘라내지 않는다. 잘린 분까지 발송 완료로 기록되어 영영
     사라지던 문제 때문이며, 분량은 paginate 가 메시지 분할로 처리한다.
+
+    dry 가 0 이 아니면 연속 헛파싱 경보를 머리에 붙인다.
     """
     def group(kind):
         return sorted([r for r in rows if r["type"] == kind], key=lambda r: -r["value"])
@@ -528,8 +552,10 @@ def build_congress_message(rows, scanned, since):
     items = [
         (f"<b>🏛 하원 PTR</b> — {since:%m/%d} 이후 신규 제출", None),
         ("<i>신고지연 최대 45일 · 금액은 구간 공시(상단 기준 정렬)</i>", None),
-        ("", None),
     ]
+    if dry:
+        items.append((f"<i>⚠️ PTR {dry}건 연속 거래 0건 — 파서 점검 필요</i>", None))
+    items.append(("", None))
     # 교환(E)은 드물어 항상 비어 있는 칸을 만들 필요가 없다. 다만 예전처럼
     # 조용히 버리면 상태에는 기록되고 화면에는 없는 건이 생긴다.
     for label, kind, always in (("매수", "purchase", True),
@@ -598,29 +624,34 @@ def run_insider():
 
 def run_congress():
     since = dt.date.today() - dt.timedelta(days=CONGRESS_LOOKBACK_DAYS)
-    seen, done_docs = load_state()
+    seen, done_docs, dry = load_state()
     rows, scanned, fetched = house_ptr.collect_house(since, skip_docs=done_docs)
 
-    if len(fetched) >= PTR_ALERT_MIN_DOCS and not rows and not scanned:
-        raise RuntimeError(f"PTR {len(fetched)}건에서 거래 0건 파싱 — 파서 점검 필요")
+    dry = dry_streak(dry, len(fetched) - len(scanned), len(rows))
+    broken = dry >= PTR_DRY_DOCS_ALERT
 
     eligible = filter_congress(rows)
     fresh = [r for r in eligible if r["key"] not in seen]
 
     sent = set()
-    if fresh or scanned:
-        msgs, sent = paginate(build_congress_message(fresh, scanned, since))
+    if fresh or scanned or broken:
+        msgs, sent = paginate(build_congress_message(fresh, scanned, since, dry if broken else 0))
         for m in msgs:
             send(m)
     seen |= sent
     print(f"congress fetched={len(fetched)} new={len(fresh)} "
-          f"scanned={len(scanned)} sent={len(sent)}")
+          f"scanned={len(scanned)} sent={len(sent)} dry={dry}")
 
     # 발송이 끝난 문서만 완료 처리한다. 페이지 상한에 걸려 남은 행이 있는
     # 문서를 완료로 적으면 그 행을 다시는 받아보지 못한다.
     pending = {r["doc_id"] for r in eligible if r["key"] not in seen}
     pending |= {f["doc_id"] for f in scanned if f["doc_id"] not in sent}
-    save_state(seen, done_docs | (fetched - pending))
+    # 카운터는 예외보다 먼저 저장한다. 저장 전에 죽으면 다음 실행이 같은
+    # 자리에서 다시 세기 시작해 경보가 영영 오지 않는다.
+    save_state(seen, done_docs | (fetched - pending), dry)
+
+    if broken:
+        raise RuntimeError(f"하원 PTR {dry}건 연속 파싱 0건 — 파서 점검 필요")
 
 
 def main():
