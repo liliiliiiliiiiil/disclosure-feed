@@ -727,7 +727,7 @@ def main():
         sys.exit(f"[error] 환경변수 미설정: {', '.join(missing)}")
 
     failed = []
-    for name, fn in (("내부자", run_insider), ("하원", run_congress)):
+    for name, fn in (("내부자", run_insider), ("의회", run_congress)):
         try:
             fn()
         except Exception as e:

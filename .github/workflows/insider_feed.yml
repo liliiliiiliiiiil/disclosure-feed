@@ -25,14 +25,30 @@ jobs:
 
       # 의회 공시 중복 발송 방지용 상태. 키에 run_id를 넣어 매번 새로 저장하고,
       # restore-keys 로 직전 실행분을 복원한다.
-      - uses: actions/cache@v6
+      #
+      # restore 와 save 를 나눠 둔 이유: 한쪽 원의 소스가 막혀 스크립트가 0 이
+      # 아닌 코드로 끝나면, 합쳐진 actions/cache 의 post 단계는 건너뛰어진다.
+      # 그러면 그 실행에서 갱신한 상태가 통째로 버려진다 — 발송 완료 기록까지.
+      # 다음 실행이 옛 상태를 복원해 같은 공시를 다시 보내고, 파서 건강도
+      # 카운터는 제자리걸음을 해 경보가 영영 오지 않는다. 실측(2026-10-24,
+      # 10-27)에서 dry.house 가 두 번 다 6 에 멈춰 있었다.
+      # 상태는 실행의 성패와 무관하게 보존돼야 하므로 save 는 always().
+      - uses: actions/cache/restore@v6
         with:
           path: .state
           key: insider-feed-state-${{ github.run_id }}
           restore-keys: insider-feed-state-
 
-      - run: python insider_feed.py
+      - run: |
+          mkdir -p .state        # 첫 실행에서 save 가 빈 경로로 실패하지 않도록
+          python insider_feed.py
         env:
           SEC_UA: ${{ secrets.SEC_UA }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - uses: actions/cache/save@v6
+        if: always()
+        with:
+          path: .state
+          key: insider-feed-state-${{ github.run_id }}
