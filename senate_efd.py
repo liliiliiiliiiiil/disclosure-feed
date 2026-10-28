@@ -34,7 +34,15 @@ PTR_REPORT_TYPE = 11  # 실측: report_types=[11] 이 Periodic Transaction Repor
 PAGE = 100
 
 HTTP_RETRIES = 3
-RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+# 403 도 재시도 대상이다. EFD 앞단의 WAF 가 간헐적으로 막는데, 실측
+# (2026-10-24 09:39 / 10-27 10:44 / 10-28 11:27 UTC) 매번 첫 요청이 403 이었고
+# 같은 UA 로 10-28 13:29 에는 200 이 돌아왔다. 영구 거부가 아니므로 한 번의
+# 403 에 피드를 포기할 이유가 없다.
+#
+# 다만 초 단위로는 풀리지 않는다. 그래서 403 만 간격을 크게 잡는다. 시도
+# 횟수는 늘리지 않는다 — 막고 있는 상대를 더 두드리는 건 해법이 아니다.
+RETRY_STATUS = frozenset({403, 429, 500, 502, 503, 504})
+WAF_BACKOFF = 30      # 403: 30, 60, 120초. 그 외: 1, 2, 4초.
 
 _lock = threading.Lock()
 _next = [0.0]
@@ -49,8 +57,13 @@ def _throttle():
         _next[0] = now + 1.0 / RATE
 
 
+def _backoff(status, attempt):
+    """재시도 간격. WAF 의 403 은 짧게 기다려서는 풀리지 않는다."""
+    return (WAF_BACKOFF if status == 403 else 1) * 2 ** attempt
+
+
 def _request(s, method, url, **kw):
-    """일시적 오류(429/5xx/네트워크)는 지수 백오프로 재시도한다."""
+    """일시적 오류(403/429/5xx/네트워크)는 지수 백오프로 재시도한다."""
     kw.setdefault("timeout", 60)
     for attempt in range(HTTP_RETRIES + 1):
         last = attempt == HTTP_RETRIES
@@ -60,10 +73,12 @@ def _request(s, method, url, **kw):
             if r.status_code not in RETRY_STATUS or last:
                 r.raise_for_status()
                 return r
+            delay = _backoff(r.status_code, attempt)
         except (requests.ConnectionError, requests.Timeout):
             if last:
                 raise
-        time.sleep(2 ** attempt)
+            delay = _backoff(None, attempt)
+        time.sleep(delay)
 
 
 CSRF_RE = re.compile(

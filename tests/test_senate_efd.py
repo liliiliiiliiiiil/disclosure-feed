@@ -50,6 +50,75 @@ class ParseTxns(unittest.TestCase):
                         f"상원 행에 없는 키: {shared - set(self.rows[0])}")
 
 
+class WafRetry(unittest.TestCase):
+    """EFD 앞단 WAF 의 403 은 일시적이므로 재시도한다."""
+
+    class _Resp:
+        def __init__(self, status):
+            self.status_code = status
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                import requests
+                raise requests.HTTPError(f"{self.status_code} for url")
+
+    class _Session:
+        """정해둔 상태코드를 차례로 돌려준다."""
+
+        def __init__(self, statuses):
+            self.statuses = list(statuses)
+            self.calls = 0
+
+        def request(self, method, url, **kw):
+            self.calls += 1
+            return WafRetry._Resp(self.statuses.pop(0))
+
+    def setUp(self):
+        self.slept = []
+        self.orig_sleep, self.orig_throttle = se.time.sleep, se._throttle
+        se.time.sleep = self.slept.append
+        se._throttle = lambda: None
+
+    def tearDown(self):
+        se.time.sleep, se._throttle = self.orig_sleep, self.orig_throttle
+
+    def test_403_then_success(self):
+        sess = self._Session([403, 403, 200])
+        r = se._request(sess, "GET", "http://x/")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(sess.calls, 3)
+
+    def test_403_uses_the_long_backoff(self):
+        sess = self._Session([403, 200])
+        se._request(sess, "GET", "http://x/")
+        self.assertEqual(self.slept, [se.WAF_BACKOFF])
+
+    def test_other_retryable_keeps_the_short_backoff(self):
+        # 503 까지 분 단위로 기다리게 만들면 안 된다.
+        sess = self._Session([503, 200])
+        se._request(sess, "GET", "http://x/")
+        self.assertEqual(self.slept, [1])
+
+    def test_persistent_403_still_raises(self):
+        import requests
+        sess = self._Session([403] * (se.HTTP_RETRIES + 1))
+        with self.assertRaises(requests.HTTPError):
+            se._request(sess, "GET", "http://x/")
+        self.assertEqual(sess.calls, se.HTTP_RETRIES + 1)
+
+    def test_404_is_not_retried(self):
+        import requests
+        sess = self._Session([404])
+        with self.assertRaises(requests.HTTPError):
+            se._request(sess, "GET", "http://x/")
+        self.assertEqual(sess.calls, 1)
+
+    def test_backoff_schedule(self):
+        self.assertEqual([se._backoff(403, i) for i in range(3)], [30, 60, 120])
+        self.assertEqual([se._backoff(503, i) for i in range(3)], [1, 2, 4])
+        self.assertEqual([se._backoff(None, i) for i in range(3)], [1, 2, 4])
+
+
 class TxnType(unittest.TestCase):
     def test_known_types(self):
         self.assertEqual(se._txn_type("Purchase"), "purchase")

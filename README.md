@@ -187,7 +187,13 @@ unmarked.
 ## Failure handling
 
 Transient HTTP errors (429, 5xx, connection resets, timeouts) are retried three
-times with exponential backoff. A filing that still cannot be fetched is
+times with exponential backoff. The Senate also retries 403: the WAF in front
+of its search refuses requests intermittently — three scheduled runs in a row
+were turned away between 09:39 and 11:27 UTC, while the same User-Agent was
+served normally at 13:29 the same day. Those retries wait 30, 60 and 120
+seconds rather than seconds, since the refusal does not lift quickly; the
+number of attempts is unchanged, because knocking harder at something that is
+refusing is not a fix. A filing that still cannot be fetched is
 counted rather than dropped silently, and the count appears in the digest.
 
 Format changes at the source would otherwise produce an empty digest that looks
