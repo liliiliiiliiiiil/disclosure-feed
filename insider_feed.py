@@ -291,6 +291,21 @@ def parse_form4(path):
         value = sh * px
         if value <= 0:
             continue
+        # 거래 후 보유주식수. 금액만으로는 이 거래가 그 사람에게 큰 결정인지
+        # 알 수 없다. 거래 전 보유량을 역산하면 "지분을 얼마나 움직였나"가
+        # 나오고, 그게 $2M 이라는 숫자보다 훨씬 많은 것을 말한다.
+        # 실측(2026-10-27 제출분) P/S 행 29건 전부에 이 값이 있었다.
+        after = t.findtext(
+            "postTransactionAmounts/sharesOwnedFollowingTransaction/value")
+        try:
+            after = float(after) if after else None
+        except ValueError:
+            after = None
+        # D=본인 직접 보유, I=신탁·법인 등 간접 보유. 간접은 같은 금액이라도
+        # 본인 돈이 아닐 수 있어 따로 표기한다.
+        di = (t.findtext("ownershipNature/directOrIndirectOwnership/value")
+              or "").strip().upper()
+
         out.append({
             "ticker": ticker,
             "src": path.rsplit("/", 1)[-1].rsplit(".", 1)[0],
@@ -302,6 +317,8 @@ def parse_form4(path):
             "value": value,
             "plan": is_plan,
             "date": t.findtext("transactionDate/value") or "",
+            "after": after,
+            "direct": {"D": True, "I": False}.get(di),
         })
     return out
 
@@ -318,6 +335,23 @@ def collect_form4(date):
             else:
                 rows.extend(chunk)
     return rows, failed, len(paths)
+
+
+def _stake(code, shares, after):
+    """(거래 전 보유량, 지분 변화율). 판정할 수 없으면 (None, None).
+
+    변화율은 '거래 전 보유량 대비 이번에 움직인 양'이다. 매수면 양수,
+    매도면 음수. 합산된 거래에 대해 한 번만 계산해야 한다 — tranche 별로
+    내면 분모가 매번 달라져 실제보다 작게 보인다.
+    """
+    if after is None or shares <= 0:
+        return None, None
+    before = after - shares if code == "P" else after + shares
+    if before < 0:            # 신고 내 수치가 어긋남
+        return None, None
+    if before == 0:           # 무에서 새로 산 경우. 비율이 정의되지 않는다.
+        return 0.0, None
+    return before, (shares / before) * (1 if code == "P" else -1)
 
 
 def aggregate(rows):
@@ -339,8 +373,17 @@ def aggregate(rows):
         m["plan"] = m["plan"] or r["plan"]
         if r["date"] < m["date"]:
             m["date"] = r["date"]
+        # 보유량은 더하지 않는다. tranche 마다 '그 시점의 잔고'라 마지막
+        # 것만이 하루를 마친 보유량이다. 문서 순서가 곧 체결 순서다.
+        # (실측 MSM: 2,389,143 -> 2,523,805 -> 2,578,192)
+        m["after"] = r["after"]
+        # 직접분과 간접분이 섞였으면 비율의 분모가 하나가 아니다. 섞이면 버린다.
+        if r["direct"] is not m["direct"]:
+            m["direct"] = None
+            m["after"] = None
     for m in merged.values():
         m["price"] = m["value"] / m["shares"] if m["shares"] else 0.0
+        m["before"], m["stake"] = _stake(m["code"], m["shares"], m["after"])
     return list(merged.values())
 
 
@@ -475,6 +518,31 @@ def money(v):
     return f"${v:,.0f}"
 
 
+def stake_str(r):
+    """지분 변화 표기. 판정할 수 없으면 빈 문자열.
+
+    금액 옆에 붙는 한 조각이다. "$2.0M" 은 이 거래가 그 사람에게 무엇인지
+    말해주지 않지만 "지분 +11%" 는 말해준다.
+    """
+    if r.get("before") == 0 and r["code"] == "P":
+        txt = "신규"                      # 보유가 없던 종목을 새로 샀다
+    elif r.get("stake") is None:
+        return ""
+    elif r["code"] == "S" and r["stake"] <= -1.0:
+        txt = "전량 매도"
+    else:
+        v = r["stake"] * 100
+        if abs(v) >= 1000:               # 보유가 미미했던 경우. %로는 안 읽힌다.
+            txt = f"지분 {'+' if v > 0 else '-'}{abs(v) / 100:,.0f}배"
+        elif abs(v) >= 1:
+            txt = f"지분 {v:+.0f}%"
+        else:
+            txt = f"지분 {v:+.1f}%"
+    if r.get("direct") is False:
+        txt += " (간접)"                  # 신탁·법인 경유. 본인 돈이 아닐 수 있다.
+    return txt
+
+
 def who_of(r):
     n = esc(r["owners"][0])
     if len(r["owners"]) > 1:
@@ -542,14 +610,16 @@ def build_insider_message(buys, sells, date, total, filings, failed, broken):
     for r in buys:
         tag = f" 🔥x{r['cluster']}" if r["cluster"] >= CLUSTER_MIN else ""
         t = f" · {esc(r['title'])}" if r["title"] else ""
-        lines.append(f"{tv(r['ticker'])} {money(r['value'])} @ {price(r['price'])}{tag} — {who_of(r)}{t}")
+        st = f" · {esc(stake_str(r))}" if stake_str(r) else ""
+        lines.append(f"{tv(r['ticker'])} {money(r['value'])} @ {price(r['price'])}{st}{tag} — {who_of(r)}{t}")
 
     lines += ["", f"<b>매도 (S)</b>  <i>10b5-1 제외 · ≥{money(MIN_SELL_VALUE)}</i>"]
     if not sells:
         lines.append("<i>없음</i>")
     for r in sells:
         t = f" · {esc(r['title'])}" if r["title"] else ""
-        lines.append(f"{tv(r['ticker'])} {money(r['value'])} @ {price(r['price'])} — {who_of(r)}{t}")
+        st = f" · {esc(stake_str(r))}" if stake_str(r) else ""
+        lines.append(f"{tv(r['ticker'])} {money(r['value'])} @ {price(r['price'])}{st} — {who_of(r)}{t}")
 
     return [(ln, None) for ln in lines]
 

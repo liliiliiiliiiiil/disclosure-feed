@@ -18,7 +18,12 @@ CIK|Company Name|Form Type|Date Filed|Filename
 
 def form4(ticker="ACME", owners=(("Smith John", "Chief Executive Officer", "0", "0"),),
           txns=(("P", "Common Stock", "1000", "50.00", "2025-01-02"),),
-          aff10b5=None, footnote=None):
+          aff10b5=None, footnote=None, after=None, direct="D"):
+    """after 를 주면 postTransactionAmounts 를, direct 는 ownershipNature 를 넣는다.
+
+    실제 제출본에는 둘 다 늘 들어 있다(실측 2026-10-27, P/S 29행 전부).
+    기본값을 None 으로 둔 것은 누락된 신고서도 다뤄야 하기 때문이다.
+    """
     """Form 4 전체 제출본(.txt) 흉내. SGML 래퍼 안에 XML 이 들어간다."""
     ro = "".join(
         f"""
@@ -32,6 +37,14 @@ def form4(ticker="ACME", owners=(("Smith John", "Chief Executive Officer", "0", 
   </reportingOwner>"""
         for name, title, director, tenpct in owners
     )
+    post = (f"""
+      <postTransactionAmounts>
+        <sharesOwnedFollowingTransaction><value>{after}</value></sharesOwnedFollowingTransaction>
+      </postTransactionAmounts>""" if after is not None else "")
+    own = (f"""
+      <ownershipNature>
+        <directOrIndirectOwnership><value>{direct}</value></directOrIndirectOwnership>
+      </ownershipNature>""" if direct else "")
     rows = "".join(
         f"""
     <nonDerivativeTransaction>
@@ -41,7 +54,7 @@ def form4(ticker="ACME", owners=(("Smith John", "Chief Executive Officer", "0", 
       <transactionAmounts>
         <transactionShares><value>{shares}</value></transactionShares>
         <transactionPricePerShare><value>{px}</value></transactionPricePerShare>
-      </transactionAmounts>
+      </transactionAmounts>{post}{own}
     </nonDerivativeTransaction>"""
         for code, sec, shares, px, date in txns
     )

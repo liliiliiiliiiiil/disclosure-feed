@@ -54,6 +54,20 @@ class ParseForm4(unittest.TestCase):
                          ("ACME", "P", 50_000.0, "SENIOR"))
         self.assertFalse(r["plan"])
 
+    def test_reads_post_transaction_holding(self):
+        rows = self.parse(form4(after="2578192", direct="D"))
+        self.assertEqual(rows[0]["after"], 2_578_192.0)
+        self.assertTrue(rows[0]["direct"])
+
+    def test_reads_indirect_ownership(self):
+        self.assertFalse(self.parse(form4(after="100", direct="I"))[0]["direct"])
+
+    def test_absent_holding_is_none_not_zero(self):
+        # 0 으로 떨어뜨리면 "전량 매도"로 잘못 읽힌다.
+        r = self.parse(form4(after=None, direct=None))[0]
+        self.assertIsNone(r["after"])
+        self.assertIsNone(r["direct"])
+
     def test_non_listed_issuer_dropped(self):
         self.assertEqual(self.parse(form4(ticker="NONE")), [])
 
@@ -108,7 +122,7 @@ def _congress_row(doc, **kw):
 def _row(**kw):
     base = {"ticker": "AAA", "src": "s1", "owners": ("X",), "title": "", "rank": "",
             "code": "P", "shares": 100.0, "value": 200_000.0, "plan": False,
-            "date": "2025-01-02"}
+            "date": "2025-01-02", "after": None, "direct": True}
     base.update(kw)
     return base
 
@@ -124,6 +138,105 @@ class Aggregate(unittest.TestCase):
         self.assertEqual(rows[0]["value"], 10_000.0)
         self.assertEqual(rows[0]["price"], 25.0)
         self.assertEqual(rows[0]["date"], "2025-01-02")
+
+
+class Stake(unittest.TestCase):
+    """지분 변화율. 숫자는 2026-10-27 제출분 실측값이다."""
+
+    def test_real_aggregated_buy(self):
+        # MSM: 세 tranche 합계 250,000주, 최종 보유 2,578,192
+        self.assertEqual(f._stake("P", 250_000, 2_578_192)[0], 2_328_192)
+        self.assertAlmostEqual(f._stake("P", 250_000, 2_578_192)[1], 0.10738, 4)
+
+    def test_real_aggregated_sell(self):
+        # NFLX: 세 tranche 합계 17,980주, 최종 보유 79,690
+        before, stake = f._stake("S", 17_980, 79_690)
+        self.assertEqual(before, 97_670)
+        self.assertAlmostEqual(stake, -0.18409, 4)
+
+    def test_sign_follows_direction(self):
+        self.assertGreater(f._stake("P", 10, 110)[1], 0)
+        self.assertLess(f._stake("S", 10, 90)[1], 0)
+
+    def test_new_position_has_no_ratio(self):
+        # 보유가 0 이었으면 비율의 분모가 없다.
+        self.assertEqual(f._stake("P", 500, 500), (0.0, None))
+
+    def test_full_exit(self):
+        self.assertEqual(f._stake("S", 1000, 0), (1000, -1.0))
+
+    def test_missing_holding_is_not_guessed(self):
+        self.assertEqual(f._stake("P", 100, None), (None, None))
+
+    def test_inconsistent_filing_is_dropped(self):
+        # 산 주식 수가 거래 후 보유보다 많으면 숫자가 어긋난 것이다.
+        self.assertEqual(f._stake("P", 500, 100), (None, None))
+
+
+class StakeText(unittest.TestCase):
+    def fmt(self, code, shares, after, direct=True):
+        before, stake = f._stake(code, shares, after)
+        return f.stake_str({"code": code, "shares": shares, "after": after,
+                            "before": before, "stake": stake, "direct": direct})
+
+    def test_percent(self):
+        self.assertEqual(self.fmt("P", 250_000, 2_578_192), "지분 +11%")
+        self.assertEqual(self.fmt("S", 17_980, 79_690), "지분 -18%")
+
+    def test_sub_one_percent_keeps_a_decimal(self):
+        # CBKM 실측: 500주, 거래후 81,853 -> 0.6%. 반올림하면 "+0%" 가 된다.
+        self.assertEqual(self.fmt("P", 500, 81_853), "지분 +0.6%")
+
+    def test_large_ratio_reads_as_a_multiple(self):
+        self.assertEqual(self.fmt("P", 10_000, 10_100), "지분 +100배")
+
+    def test_new_and_exit(self):
+        self.assertEqual(self.fmt("P", 500, 500), "신규")
+        self.assertEqual(self.fmt("S", 1000, 0), "전량 매도")
+
+    def test_indirect_is_marked(self):
+        # UTHR 실측: 간접 보유 600주 매도
+        self.assertEqual(self.fmt("S", 600, 333_343, direct=False),
+                         "지분 -0.2% (간접)")
+
+    def test_unknown_renders_nothing(self):
+        self.assertEqual(self.fmt("P", 100, None), "")
+
+
+class AggregateStake(unittest.TestCase):
+    def rows(self, *specs):
+        return [dict(_row(code=c, shares=sh, value=sh * 10.0, after=a,
+                          direct=d), date="2025-01-02")
+                for c, sh, a, d in specs]
+
+    def test_last_tranche_is_the_final_holding(self):
+        # 보유량은 더하는 값이 아니라 마지막 시점의 잔고다.
+        out = f.aggregate(self.rows(("P", 60_951, 2_389_143, True),
+                                    ("P", 134_662, 2_523_805, True),
+                                    ("P", 54_387, 2_578_192, True)))
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["shares"], 250_000)
+        self.assertEqual(out[0]["after"], 2_578_192)
+        self.assertEqual(out[0]["before"], 2_328_192)
+
+    def test_ratio_is_computed_on_the_total_not_per_tranche(self):
+        out = f.aggregate(self.rows(("P", 60_951, 2_389_143, True),
+                                    ("P", 134_662, 2_523_805, True),
+                                    ("P", 54_387, 2_578_192, True)))
+        # tranche 별로는 2.6/5.6/2.2% 지만 실제로 움직인 지분은 10.7% 다.
+        self.assertAlmostEqual(out[0]["stake"], 0.10738, 4)
+
+    def test_mixed_direct_and_indirect_is_dropped(self):
+        # 직접분과 간접분은 분모가 다른 별개의 보유다. 섞이면 비율이 거짓이 된다.
+        out = f.aggregate(self.rows(("P", 100, 1_100, True),
+                                    ("P", 100, 500, False)))
+        self.assertIsNone(out[0]["after"])
+        self.assertIsNone(out[0]["stake"])
+        self.assertIsNone(out[0]["direct"])
+
+    def test_missing_holding_propagates(self):
+        out = f.aggregate(self.rows(("P", 100, None, True)))
+        self.assertIsNone(out[0]["stake"])
 
 
 class Cluster(unittest.TestCase):

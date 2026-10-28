@@ -41,6 +41,30 @@ weak signal on its own.
 
 Thresholds live at the top of `insider_feed.py`.
 
+## What a dollar figure does not say
+
+"$2.0M" says nothing about whether the trade mattered to the person who made
+it. A chief executive putting $2M into a stake already worth $200M is
+rebalancing; the same $2M from someone who held almost nothing is a different
+act entirely. Each line therefore carries how much the filer's own holding
+moved, taken from the `sharesOwnedFollowingTransaction` figure the filing
+already reports — no extra source, and present on every P/S row sampled from
+a live index.
+
+```
+MSM   $23.9M @ $95.49 · 지분 +11%   ← large, and a real addition
+NEWCO  $1.2M @ $30.00 · 지분 +100배 ← small in dollars, nearly the whole position
+FRESH   $405K @ $45.00 · 신규       ← a position that did not exist before
+```
+
+The figure is computed once per aggregated trade, not per tranche: MSM above
+filed as three fills reading 2.6%, 5.6% and 2.2%, which together are 10.7% of
+what the filer held beforehand. Holdings held through a trust or an entity are
+marked `(간접)`, since the same dollars need not be the filer's own. Where the
+figure cannot be trusted — the filing omits the holding, its numbers contradict
+each other, or direct and indirect lots are mixed under one issuer so the
+denominator is not one number — nothing is shown rather than a guess.
+
 ## Files
 
 ```
