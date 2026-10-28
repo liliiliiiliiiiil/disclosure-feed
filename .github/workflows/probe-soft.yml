@@ -1,0 +1,104 @@
+# 임시 탐색용. Form 4 의 '거래 후 보유주식수' 필드가 실제로 어떻게 들어 있는지
+# 확인한다. 지분 변화율 표시의 근거가 되는 값이다. 확인 후 삭제.
+name: probe-soft
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: |
+          python - <<'PY'
+          import collections, re
+          import xml.etree.ElementTree as ET
+          import insider_feed as f
+
+          target = f._prev_business_day(__import__("datetime").date.today())
+          paths = f.form4_filings(target)
+          print(f"=== {target} Form 4 제출 {len(paths)}건 중 앞 40건 조사 ===", flush=True)
+
+          SOFT = "postTransactionAmounts/sharesOwnedFollowingTransaction/value"
+          DI = "ownershipNature/directOrIndirectOwnership/value"
+
+          stat = collections.Counter()
+          di_vals = collections.Counter()
+          samples, newpos, mixed = [], [], []
+
+          for path in paths[:40]:
+              try:
+                  raw = f._get(f"https://www.sec.gov/Archives/{path}").text
+              except Exception as e:
+                  stat["fetch_fail"] += 1
+                  continue
+              m = re.search(r"<ownershipDocument>.*?</ownershipDocument>", raw, re.S)
+              if not m:
+                  stat["no_doc"] += 1
+                  continue
+              try:
+                  doc = ET.fromstring(m.group(0))
+              except ET.ParseError:
+                  stat["parse_fail"] += 1
+                  continue
+              tk = (doc.findtext("issuer/issuerTradingSymbol") or "?").strip().upper()
+              per_key = collections.defaultdict(set)
+
+              for t in doc.findall("nonDerivativeTable/nonDerivativeTransaction"):
+                  code = t.findtext("transactionCoding/transactionCode")
+                  if code not in ("P", "S"):
+                      continue
+                  stat["ps_rows"] += 1
+                  soft = t.findtext(SOFT)
+                  di = (t.findtext(DI) or "").strip().upper()
+                  sh = t.findtext("transactionAmounts/transactionShares/value")
+                  stat["soft_present" if soft else "soft_MISSING"] += 1
+                  di_vals[di or "<없음>"] += 1
+                  per_key[(tk, code)].add(di)
+                  if soft and sh:
+                      try:
+                          a, s_ = float(soft), float(sh)
+                      except ValueError:
+                          stat["soft_nonnumeric"] += 1
+                          continue
+                      before = a - s_ if code == "P" else a + s_
+                      if len(samples) < 12:
+                          samples.append((tk, code, s_, a, before, di))
+                      if code == "P" and before <= 0:
+                          stat["buy_before_zero"] += 1
+                          if len(newpos) < 4:
+                              newpos.append((tk, s_, a))
+                      if code == "S" and a == 0:
+                          stat["sell_to_zero"] += 1
+              for k, dis in per_key.items():
+                  if len(dis) > 1:
+                      stat["mixed_D_and_I"] += 1
+                      if len(mixed) < 4:
+                          mixed.append((k, sorted(dis)))
+
+          print(f"\n=== 집계 ===", flush=True)
+          for k, v in sorted(stat.items()):
+              print(f"  {k:<20} {v}", flush=True)
+          print(f"  directOrIndirect 값 분포: {dict(di_vals)}", flush=True)
+
+          print(f"\n=== 샘플 (티커 코드 거래주식 거래후보유 거래전보유 D/I) ===", flush=True)
+          for tk, code, s_, a, b, di in samples:
+              pct = (s_ / b * 100) if b > 0 else float("nan")
+              print(f"  {tk:<6} {code}  {s_:>12,.0f} {a:>14,.0f} {b:>14,.0f}  {di or '-':<2}"
+                    f"  변화율={pct:>8.1f}%" if b > 0 else
+                    f"  {tk:<6} {code}  {s_:>12,.0f} {a:>14,.0f} {b:>14,.0f}  {di or '-':<2}  변화율=계산불가",
+                    flush=True)
+
+          print(f"\n=== 거래 전 보유 0 (신규 포지션) 예시 ===", flush=True)
+          print(f"  {newpos or '없음'}", flush=True)
+          print(f"\n=== 한 (티커,코드) 안에 D 와 I 가 섞인 경우 ===", flush=True)
+          print(f"  {mixed or '없음'}", flush=True)
+          PY
+        env:
+          SEC_UA: ${{ secrets.SEC_UA }}
