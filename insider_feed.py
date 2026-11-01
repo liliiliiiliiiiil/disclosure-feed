@@ -757,8 +757,14 @@ def run_insider():
     buys, sells = filter_buys(rows), filter_sells(rows)
 
     broken = filings >= FORM4_ALERT_MIN_FILINGS and not rows
+    # 지분 변화율이 몇 건에 붙었는지. 보유량 누락·잔고 불일치로 조용히
+    # 빠지는 기능이라, 텔레그램 메시지만 보면 비율이 떨어져도 모른다.
+    # sent 쪽이 독자가 실제로 보는 수치다.
+    sent = buys + sells
     print(f"form4 target={target} filings={filings} failed={failed} "
-          f"rows={len(rows)} buys={len(buys)} sells={len(sells)}")
+          f"rows={len(rows)} buys={len(buys)} sells={len(sells)} "
+          f"stake={sum(1 for r in rows if stake_str(r))}/{len(rows)} "
+          f"sent_stake={sum(1 for r in sent if stake_str(r))}/{len(sent)}")
 
     msgs, _ = paginate(
         build_insider_message(buys, sells, target, len(rows), filings, failed, broken))
