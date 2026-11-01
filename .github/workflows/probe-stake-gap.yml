@@ -1,0 +1,96 @@
+# 임시 진단용. 지분 변화율이 비는 건을 원인별로 분류한다.
+# 2026-10-30 다이제스트에서 RAPP 매수 $20.4M 에만 변화율이 없었다. 확인 후 삭제.
+name: probe-stake-gap
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: |
+          python - <<'PY'
+          import collections, datetime as dt
+          import insider_feed as f
+
+          DATE = dt.date(2026, 10, 30)     # 문제의 다이제스트가 조회한 인덱스
+          paths = f.form4_filings(DATE)
+          print(f"=== {DATE} Form 4 제출 {len(paths)}건 ===", flush=True)
+
+          raw = []
+          failed = 0
+          for p in paths:
+              rows = f.parse_form4(p)
+              if rows is None:
+                  failed += 1
+                  continue
+              raw.extend(rows)
+          print(f"수집 실패 {failed}건 / P·S 원시행 {len(raw)}건", flush=True)
+
+          by_key = collections.defaultdict(list)
+          for r in raw:
+              by_key[(r["src"], r["ticker"], r["code"])].append(r)
+
+          agg = f.aggregate([dict(r) for r in raw])
+
+          def cause(key):
+              rs = by_key[key]
+              if any(r["after"] is None for r in rs):
+                  return "신고서에 보유량 누락"
+              if len({r["direct"] for r in rs}) > 1:
+                  return "직접·간접 섞임 (내가 억제)"
+              return "수치 모순 (산 주식 > 거래후 보유)"
+
+              
+          stat = collections.Counter()
+          examples = collections.defaultdict(list)
+          for m in agg:
+              key = (m["src"], m["ticker"], m["code"])
+              has = bool(f.stake_str(m))
+              stat[f"{m['code']}:{'표시' if has else '누락'}"] += 1
+              if not has:
+                  c = cause(key)
+                  stat[f"  원인 {c}"] += 1
+                  if len(examples[c]) < 5:
+                      examples[c].append((m["ticker"], m["code"],
+                                          f"${m['value']/1e6:.1f}M", len(by_key[key])))
+
+          print(f"\n=== 변화율 표시 여부 ===", flush=True)
+          for k in sorted(stat):
+              print(f"  {k:<40} {stat[k]}", flush=True)
+
+          print(f"\n=== 누락 원인별 예시 (티커, 코드, 금액, 원시행수) ===", flush=True)
+          for c, ex in examples.items():
+              print(f"  [{c}]", flush=True)
+              for e in ex:
+                  print(f"     {e}", flush=True)
+
+          print(f"\n=== RAPP 상세 ===", flush=True)
+          hit = [k for k in by_key if k[1] == "RAPP"]
+          if not hit:
+              print("  이 인덱스에 RAPP 없음", flush=True)
+          for key in hit:
+              print(f"  key={key}  원시행 {len(by_key[key])}건  원인={cause(key)}", flush=True)
+              for r in by_key[key]:
+                  print(f"     code={r['code']} shares={r['shares']:>12,.0f} "
+                        f"after={r['after']!r:>14} direct={r['direct']!r:<6} "
+                        f"owners={r['owners']} title={r['title']!r}", flush=True)
+              m = next(x for x in agg if (x["src"], x["ticker"], x["code"]) == key)
+              print(f"     -> 합산: shares={m['shares']:,.0f} after={m['after']!r} "
+                    f"direct={m['direct']!r} before={m['before']!r} stake={m['stake']!r}"
+                    f" 표기={f.stake_str(m)!r}", flush=True)
+
+          print(f"\n=== 참고: See Remarks 직함 빈도 ===", flush=True)
+          titles = collections.Counter(r["title"] for r in raw)
+          for t, n in titles.most_common(12):
+              print(f"  {n:>3}  {t!r}", flush=True)
+          PY
+        env:
+          SEC_UA: ${{ secrets.SEC_UA }}
