@@ -1,0 +1,138 @@
+# 임시 검증용. 풀별 역산(1bad9cb) 이 실제 데이터에서 맞게 나오는지 본다.
+# 프로덕션 경로(collect_form4 -> aggregate -> stake_str) 를 그대로 쓰고,
+# 이전 계산(마지막 행 잔고)과 나란히 찍어 바뀐 지점을 전부 드러낸다.
+# 확인 후 삭제.
+name: probe-stake-verify
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: |
+          python - <<'PY'
+          import collections, datetime as dt
+          import insider_feed as f
+
+          DATE = dt.date(2026, 10, 30)
+          rows, failed, filings = f.collect_form4(DATE)
+          merged = f.aggregate(rows)
+          print(f"=== {DATE}: 제출 {filings}건 (수집실패 {failed}), "
+                f"행 {len(rows)}건 -> 병합 {len(merged)}건 ===", flush=True)
+
+          # 병합 그룹별 원본 행 (aggregate 와 같은 키)
+          raw = collections.defaultdict(list)
+          for r in rows:
+              raw[(r["src"], r["ticker"], r["code"])].append(r)
+
+          def old_str(rs):
+              """1bad9cb 이전 계산: 마지막 행 잔고 + 직접/간접 혼재 억제."""
+              code, tot = rs[0]["code"], sum(x["shares"] for x in rs)
+              after = None if len({x["direct"] for x in rs}) > 1 else rs[-1]["after"]
+              b, s = f._stake(code, tot, after)
+              dirs = {x["direct"] for x in rs}
+              return f.stake_str({"code": code, "shares": tot, "after": after,
+                                  "before": b, "stake": s,
+                                  "direct": dirs.pop() if len(dirs) == 1 else None})
+
+          stat = collections.Counter()
+          diffs, nofig = [], []
+          impossible, agree, disagree = [], 0, 0
+
+          for m in merged:
+              key = (m["src"], m["ticker"], m["code"])
+              rs = raw[key]
+              new, old = f.stake_str(m), old_str(rs)
+              pools = {(x["direct"], x["nat"]) for x in rs}
+
+              stat["그룹"] += 1
+              stat["표시됨" if new else "표시안됨"] += 1
+              if len(rs) > 1:
+                  stat["다중행"] += 1
+                  stat["  └ 다중 풀" if len(pools) > 1 else "  └ 단일 풀"] += 1
+              if new != old:
+                  diffs.append((m["ticker"], m["code"], f"${m['value']/1e6:.1f}M",
+                                old or "(없음)", new or "(없음)",
+                                f"{len(rs)}행/{len(pools)}풀"))
+              if not new:
+                  why = ("보유량 누락" if any(x["after"] is None for x in rs)
+                         else "체인 불일치")
+                  nofig.append((m["ticker"], m["code"], f"${m['value']/1e6:.1f}M",
+                                why, f"{len(rs)}행/{len(pools)}풀"))
+
+              # 불가능한 값: 들고 있던 것보다 많이 팔 수는 없다
+              if m["code"] == "S" and m["stake"] is not None and m["stake"] < -1.0001:
+                  impossible.append((m["ticker"], m["stake"], m["before"], m["shares"]))
+
+              # 독립 교차검증: 첫 행 역산 분모 vs 마지막 행 잔고에서 되돌린 분모.
+              # 중간에 A/M/F 가 끼지 않았다면 두 값이 같아야 한다.
+              if m["before"] and all(x["after"] is not None for x in rs):
+                  byp = collections.defaultdict(list)
+                  for x in rs:
+                      byp[(x["direct"], x["nat"])].append(x)
+                  tail = 0.0
+                  for prs in byp.values():
+                      psh = sum(x["shares"] for x in prs)
+                      pa = prs[-1]["after"]
+                      tail += (pa - psh) if m["code"] == "P" else (pa + psh)
+                  if abs(tail - m["before"]) <= 0.5:
+                      agree += 1
+                  else:
+                      disagree += 1
+
+          print("\n=== 분류 ===", flush=True)
+          for k in ("그룹", "표시됨", "표시안됨", "다중행", "  └ 단일 풀", "  └ 다중 풀"):
+              if k in stat:
+                  print(f"  {k:<14} {stat[k]}", flush=True)
+
+          print(f"\n=== 이전 계산과 달라진 그룹 {len(diffs)}건 "
+                f"(티커, 코드, 금액, 이전, 지금, 구조) ===", flush=True)
+          for d in sorted(diffs, key=lambda x: -float(x[2][1:-1])):
+              print(f"  {d}", flush=True)
+          if not diffs:
+              print("  없음", flush=True)
+
+          print(f"\n=== 불가능한 값 (매도 -100% 초과) {len(impossible)}건 ===", flush=True)
+          for i in impossible:
+              print(f"  {i}", flush=True)
+          if not impossible:
+              print("  없음", flush=True)
+
+          print(f"\n=== 교차검증 (첫 행 역산 == 마지막 행 역산) ===", flush=True)
+          print(f"  일치 {agree}건 / 불일치 {disagree}건"
+                f"  (불일치는 중간에 A/M/F 가 낀 경우. 첫 행 쪽이 맞다)", flush=True)
+
+          print(f"\n=== 표시 못한 그룹 {len(nofig)}건 중 금액 상위 15 ===", flush=True)
+          for n in sorted(nofig, key=lambda x: -float(x[2][1:-1]))[:15]:
+              print(f"  {n}", flush=True)
+
+          # 실제 전송되는 줄만 따로. 사용자가 보는 누락 건수는 이쪽이다.
+          f.annotate_cluster(merged)
+          buys, sells = f.filter_buys(merged), f.filter_sells(merged)
+          print(f"\n=== 실제 전송 대상: 매수 {len(buys)} / 매도 {len(sells)} ===", flush=True)
+          for r in buys + sells:
+              s = f.stake_str(r)
+              print(f"  {r['ticker']:<6} {r['code']} {f.money(r['value']):>8}  "
+                    f"{s or '(표시없음)'}", flush=True)
+
+          want = {"RAPP", "BROS", "MCO", "OTLC", "MED", "HLT", "WRLD", "FDX"}
+          print(f"\n=== 지목 종목 ===", flush=True)
+          for m in merged:
+              if m["ticker"] in want:
+                  rs = raw[(m["src"], m["ticker"], m["code"])]
+                  pools = {(x["direct"], x["nat"]) for x in rs}
+                  print(f"  {m['ticker']:<6} {m['code']} "
+                        f"{f.money(m['value']):>8}  이전={old_str(rs) or '(없음)':<18} "
+                        f"지금={f.stake_str(m) or '(없음)':<18} "
+                        f"before={m['before']} {len(rs)}행/{len(pools)}풀", flush=True)
+          PY
+        env:
+          SEC_UA: ${{ secrets.SEC_UA }}
