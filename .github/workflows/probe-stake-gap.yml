@@ -1,5 +1,6 @@
-# 임시 진단용. 지분 변화율이 비는 건을 원인별로 분류한다.
-# 2026-10-30 다이제스트에서 RAPP 매수 $20.4M 에만 변화율이 없었다. 확인 후 삭제.
+# 임시 진단용. 현재 표시되는 변화율 중 '다중 보유 풀' 때문에 틀린 것이
+# 몇 건인지 센다. 그리고 natureOfOwnership 이 풀 식별자로 쓸 만한지 본다.
+# 확인 후 삭제.
 name: probe-stake-gap
 
 on:
@@ -17,80 +18,134 @@ jobs:
       - run: pip install -r requirements.txt
       - run: |
           python - <<'PY'
-          import collections, datetime as dt
+          import collections, datetime as dt, re
+          import xml.etree.ElementTree as ET
           import insider_feed as f
 
-          DATE = dt.date(2026, 10, 30)     # 문제의 다이제스트가 조회한 인덱스
+          DATE = dt.date(2026, 10, 30)
           paths = f.form4_filings(DATE)
           print(f"=== {DATE} Form 4 제출 {len(paths)}건 ===", flush=True)
 
-          raw = []
-          failed = 0
-          for p in paths:
-              rows = f.parse_form4(p)
-              if rows is None:
-                  failed += 1
+          SOFT = "postTransactionAmounts/sharesOwnedFollowingTransaction/value"
+          DI = "ownershipNature/directOrIndirectOwnership/value"
+          NAT = "ownershipNature/natureOfOwnership/value"
+
+          groups = collections.defaultdict(list)   # (src,ticker,code) -> 문서 순서 행
+          for path in paths:
+              try:
+                  rawtxt = f._get(f"https://www.sec.gov/Archives/{path}").text
+              except Exception:
                   continue
-              raw.extend(rows)
-          print(f"수집 실패 {failed}건 / P·S 원시행 {len(raw)}건", flush=True)
+              m = re.search(r"<ownershipDocument>.*?</ownershipDocument>", rawtxt, re.S)
+              if not m:
+                  continue
+              try:
+                  doc = ET.fromstring(m.group(0))
+              except ET.ParseError:
+                  continue
+              tk = (doc.findtext("issuer/issuerTradingSymbol") or "").strip().upper()
+              if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,5}", tk) or tk in ("N/A", "NONE"):
+                  continue
+              src = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+              for t in doc.findall("nonDerivativeTable/nonDerivativeTransaction"):
+                  code = t.findtext("transactionCoding/transactionCode")
+                  if code not in ("P", "S"):
+                      continue
+                  sh = t.findtext("transactionAmounts/transactionShares/value")
+                  px = t.findtext("transactionAmounts/transactionPricePerShare/value")
+                  if not sh or not px:
+                      continue
+                  if f.NON_COMMON_RE.search(t.findtext("securityTitle/value") or ""):
+                      continue
+                  try:
+                      sh, px = float(sh), float(px)
+                  except ValueError:
+                      continue
+                  if sh * px <= 0:
+                      continue
+                  a = t.findtext(SOFT)
+                  try:
+                      a = float(a) if a else None
+                  except ValueError:
+                      a = None
+                  groups[(src, tk, code)].append({
+                      "code": code, "shares": sh, "value": sh * px, "after": a,
+                      "di": (t.findtext(DI) or "").strip().upper(),
+                      "nat": (t.findtext(NAT) or "").strip(),
+                  })
 
-          by_key = collections.defaultdict(list)
-          for r in raw:
-              by_key[(r["src"], r["ticker"], r["code"])].append(r)
-
-          agg = f.aggregate([dict(r) for r in raw])
-
-          def cause(key):
-              rs = by_key[key]
+          def single_pool(rs):
+              """한 풀의 연속 체결이면 잔고 변화량이 거래량과 맞아떨어진다."""
               if any(r["after"] is None for r in rs):
-                  return "신고서에 보유량 누락"
-              if len({r["direct"] for r in rs}) > 1:
-                  return "직접·간접 섞임 (내가 억제)"
-              return "수치 모순 (산 주식 > 거래후 보유)"
+                  return None
+              for prev, cur in zip(rs, rs[1:]):
+                  d = cur["after"] - prev["after"]
+                  want = cur["shares"] if cur["code"] == "P" else -cur["shares"]
+                  if abs(d - want) > 0.5:
+                      return False
+              return True
 
-              
           stat = collections.Counter()
-          examples = collections.defaultdict(list)
-          for m in agg:
-              key = (m["src"], m["ticker"], m["code"])
-              has = bool(f.stake_str(m))
-              stat[f"{m['code']}:{'표시' if has else '누락'}"] += 1
-              if not has:
-                  c = cause(key)
-                  stat[f"  원인 {c}"] += 1
-                  if len(examples[c]) < 5:
-                      examples[c].append((m["ticker"], m["code"],
-                                          f"${m['value']/1e6:.1f}M", len(by_key[key])))
+          wrong, natinfo = [], []
+          for key, rs in groups.items():
+              tot = sum(r["shares"] for r in rs)
+              val = sum(r["value"] for r in rs)
+              last = rs[-1]["after"]
+              code = rs[0]["code"]
+              # 현재 코드가 내는 값 (섞임 억제 포함)
+              cur_after = None if len({r["di"] for r in rs}) > 1 else last
+              cur_before, cur_stake = f._stake(code, tot, cur_after)
+              shown = f.stake_str({"code": code, "shares": tot, "after": cur_after,
+                                   "before": cur_before, "stake": cur_stake,
+                                   "direct": None})
+              if len(rs) == 1:
+                  stat["행 1건 (문제없음)"] += 1
+                  continue
+              sp = single_pool(rs)
+              if sp is None:
+                  stat["보유량 누락"] += 1
+              elif sp:
+                  stat["다중행·단일 풀 (현재 계산 맞음)"] += 1
+              else:
+                  stat["다중행·다중 풀"] += 1
+                  if shown:
+                      stat["  └ 현재 변화율을 표시 중 (오표시)"] += 1
+                      # 풀별 합산이 내는 올바른 값
+                      pools = collections.defaultdict(list)
+                      for r in rs:
+                          pools[(r["di"], r["nat"])].append(r)
+                      bsum = 0.0
+                      for prs in pools.values():
+                          psh = sum(x["shares"] for x in prs)
+                          pa = prs[-1]["after"]
+                          bsum += (pa - psh) if code == "P" else (pa + psh)
+                      ok = (tot / bsum * 100 * (1 if code == "P" else -1)) if bsum > 0 else None
+                      wrong.append((key[1], code, f"${val/1e6:.1f}M", shown,
+                                    f"{ok:+.0f}%" if ok is not None else "계산불가",
+                                    len(pools), len(rs)))
+                  else:
+                      stat["  └ 가드에 걸려 누락 (RAPP 같은 경우)"] += 1
+                  natinfo.append((key[1], code, len(rs),
+                                  len({(r["di"], r["nat"]) for r in rs}),
+                                  [r["nat"][:34] for r in rs]))
 
-          print(f"\n=== 변화율 표시 여부 ===", flush=True)
-          for k in sorted(stat):
-              print(f"  {k:<40} {stat[k]}", flush=True)
+          print(f"\n=== 병합 그룹 {len(groups)}건 분류 ===", flush=True)
+          for k in ("행 1건 (문제없음)", "다중행·단일 풀 (현재 계산 맞음)",
+                    "다중행·다중 풀", "  └ 현재 변화율을 표시 중 (오표시)",
+                    "  └ 가드에 걸려 누락 (RAPP 같은 경우)", "보유량 누락"):
+              if k in stat:
+                  print(f"  {k:<42} {stat[k]}", flush=True)
 
-          print(f"\n=== 누락 원인별 예시 (티커, 코드, 금액, 원시행수) ===", flush=True)
-          for c, ex in examples.items():
-              print(f"  [{c}]", flush=True)
-              for e in ex:
-                  print(f"     {e}", flush=True)
+          print(f"\n=== 오표시 상세 (티커, 코드, 금액, 현재값, 풀별합산값, 풀수, 행수) ===", flush=True)
+          for w in wrong[:20]:
+              print(f"  {w}", flush=True)
+          if not wrong:
+              print("  없음", flush=True)
 
-          print(f"\n=== RAPP 상세 ===", flush=True)
-          hit = [k for k in by_key if k[1] == "RAPP"]
-          if not hit:
-              print("  이 인덱스에 RAPP 없음", flush=True)
-          for key in hit:
-              print(f"  key={key}  원시행 {len(by_key[key])}건  원인={cause(key)}", flush=True)
-              for r in by_key[key]:
-                  print(f"     code={r['code']} shares={r['shares']:>12,.0f} "
-                        f"after={r['after']!r:>14} direct={r['direct']!r:<6} "
-                        f"owners={r['owners']} title={r['title']!r}", flush=True)
-              m = next(x for x in agg if (x["src"], x["ticker"], x["code"]) == key)
-              print(f"     -> 합산: shares={m['shares']:,.0f} after={m['after']!r} "
-                    f"direct={m['direct']!r} before={m['before']!r} stake={m['stake']!r}"
-                    f" 표기={f.stake_str(m)!r}", flush=True)
-
-          print(f"\n=== 참고: See Remarks 직함 빈도 ===", flush=True)
-          titles = collections.Counter(r["title"] for r in raw)
-          for t, n in titles.most_common(12):
-              print(f"  {n:>3}  {t!r}", flush=True)
+          print(f"\n=== natureOfOwnership 이 풀을 가르는가 ===", flush=True)
+          print(f"  (티커, 코드, 행수, (di,nat) 조합수, nat 값들)", flush=True)
+          for n in natinfo[:12]:
+              print(f"  {n}", flush=True)
           PY
         env:
           SEC_UA: ${{ secrets.SEC_UA }}
