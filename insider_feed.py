@@ -305,6 +305,11 @@ def parse_form4(path):
         # 본인 돈이 아닐 수 있어 따로 표기한다.
         di = (t.findtext("ownershipNature/directOrIndirectOwnership/value")
               or "").strip().upper()
+        # "I" 하나로는 보유 풀을 식별할 수 없다. 신탁·펀드·LLC 가 전부 I 로
+        # 들어오고 각자 자기 잔고를 보고한다. 풀을 가르는 건 이 서술이다.
+        # 실측(RAPP, 2026-10-30): 네 행 모두 I 인데 natureOfOwnership 은
+        # Sofinnova / SummitTX 3개로 갈려 잔고도 전부 별개였다.
+        nat = (t.findtext("ownershipNature/natureOfOwnership/value") or "").strip()
 
         out.append({
             "ticker": ticker,
@@ -319,6 +324,7 @@ def parse_form4(path):
             "date": t.findtext("transactionDate/value") or "",
             "after": after,
             "direct": {"D": True, "I": False}.get(di),
+            "nat": nat,
         })
     return out
 
@@ -354,6 +360,60 @@ def _stake(code, shares, after):
     return before, (shares / before) * (1 if code == "P" else -1)
 
 
+def _chains(rows):
+    """한 풀로 묶인 행들이 하나의 잔고 흐름으로 이어지는가.
+
+    이어지지 않는 이유는 둘이고, 바깥에서는 구별되지 않는다.
+      - 중간에 부여(A)·옵션행사(M)·원천징수(F) 가 끼어 잔고가 움직였다
+        (정상. 첫 행 기준 역산에는 영향이 없다)
+      - 같은 (직접/간접, 서술) 아래 실은 다른 풀이 숨어 있다
+        (이때 분모를 과소평가해 비율이 과대 표시된다)
+    둘을 가릴 방법이 없으니 이어지지 않으면 버린다. 실측 BROS 에서
+    과대 표시가 2.7배였다 — 틀린 숫자를 내보내는 쪽이 훨씬 나쁘다.
+    """
+    code = rows[0]["code"]
+    for prev, cur in zip(rows, rows[1:]):
+        if prev["after"] is None or cur["after"] is None:
+            return False
+        want = cur["shares"] if code == "P" else -cur["shares"]
+        if abs((cur["after"] - prev["after"]) - want) > 0.5:
+            return False
+    return True
+
+
+def _stake_of(rows):
+    """합산된 거래의 (거래 전 보유량, 지분 변화율).
+
+    보유 풀마다 따로 역산해 합한다. 분모는 '이 신고자가 이 종목에 거래
+    직전 들고 있던 전부'가 된다. 풀 하나의 잔고만 쓰면 분모가 작아져
+    비율이 뻥튀김한다 (실측 BROS: -16% 로 나갔으나 실제 -6%).
+
+    각 풀의 기준은 마지막 행이 아니라 첫 행이다. 첫 행의 '잔고 - 거래량'
+    은 그 행 직전의 잔고라서, 이후 부여·행사·원천징수로 잔고가 어떻게
+    움직여도 흔들리지 않는다. 마지막 행을 쓰면 그 움직임이 분모에 섞인다.
+    """
+    code = rows[0]["code"]
+    pools = {}
+    for r in rows:
+        pools.setdefault((r["direct"], r["nat"]), []).append(r)
+
+    before = 0.0
+    for prs in pools.values():
+        if not _chains(prs):
+            return None, None
+        b, _ = _stake(code, prs[0]["shares"], prs[0]["after"])
+        if b is None:
+            return None, None
+        before += b
+
+    total = sum(r["shares"] for r in rows)
+    if total <= 0:
+        return None, None
+    if before == 0:               # 모든 풀이 무에서 시작
+        return 0.0, None
+    return before, (total / before) * (1 if code == "P" else -1)
+
+
 def aggregate(rows):
     """같은 신고서 내 동일 종목·동일 코드의 분할 체결을 한 건으로 합친다.
 
@@ -361,30 +421,24 @@ def aggregate(rows):
     이를 개별 거래로 두면 상위 목록을 한 사람이 잠식하고 각 조각이
     금액 하한에 걸려 전량 탈락하는 일이 생긴다. 단가는 가중평균을 쓴다.
     """
-    merged = {}
+    groups = {}
     for r in rows:
-        k = (r["src"], r["ticker"], r["code"])
-        m = merged.get(k)
-        if m is None:
-            merged[k] = dict(r)
-            continue
-        m["shares"] += r["shares"]
-        m["value"] += r["value"]
-        m["plan"] = m["plan"] or r["plan"]
-        if r["date"] < m["date"]:
-            m["date"] = r["date"]
-        # 보유량은 더하지 않는다. tranche 마다 '그 시점의 잔고'라 마지막
-        # 것만이 하루를 마친 보유량이다. 문서 순서가 곧 체결 순서다.
-        # (실측 MSM: 2,389,143 -> 2,523,805 -> 2,578,192)
-        m["after"] = r["after"]
-        # 직접분과 간접분이 섞였으면 비율의 분모가 하나가 아니다. 섞이면 버린다.
-        if r["direct"] is not m["direct"]:
-            m["direct"] = None
-            m["after"] = None
-    for m in merged.values():
+        groups.setdefault((r["src"], r["ticker"], r["code"]), []).append(r)
+
+    out = []
+    for rs in groups.values():
+        m = dict(rs[0])
+        m["shares"] = sum(r["shares"] for r in rs)
+        m["value"] = sum(r["value"] for r in rs)
+        m["plan"] = any(r["plan"] for r in rs)
+        m["date"] = min(r["date"] for r in rs)
         m["price"] = m["value"] / m["shares"] if m["shares"] else 0.0
-        m["before"], m["stake"] = _stake(m["code"], m["shares"], m["after"])
-    return list(merged.values())
+        # 표기용. 직접분과 간접분이 섞인 거래는 어느 쪽이라고 말할 수 없다.
+        dirs = {r["direct"] for r in rs}
+        m["direct"] = dirs.pop() if len(dirs) == 1 else None
+        m["before"], m["stake"] = _stake_of(rs)
+        out.append(m)
+    return out
 
 
 def _buy_eligible(r):

@@ -59,11 +59,29 @@ FRESH   $405K @ $45.00 · 신규       ← a position that did not exist before
 
 The figure is computed once per aggregated trade, not per tranche: MSM above
 filed as three fills reading 2.6%, 5.6% and 2.2%, which together are 10.7% of
-what the filer held beforehand. Holdings held through a trust or an entity are
-marked `(간접)`, since the same dollars need not be the filer's own. Where the
-figure cannot be trusted — the filing omits the holding, its numbers contradict
-each other, or direct and indirect lots are mixed under one issuer so the
-denominator is not one number — nothing is shown rather than a guess.
+what the filer held beforehand.
+
+A filing can report several holdings at once, each with its own balance — one
+filer sold through both "DM Trust Aggregator, LLC" and "DM Individual
+Aggregator, LLC"; another bought through a Sofinnova fund and three SummitTX
+entities. `directOrIndirectOwnership` does not separate those, since every one
+of them reads "I"; `natureOfOwnership` does. Each holding is therefore unwound
+on its own and the results added, so the denominator is everything the filer
+held in that issuer going in. Using one holding's balance for the whole trade
+overstates the result — it reported -16% where the answer was -6%.
+
+Each holding is unwound from its **first** purchase or sale, not its last.
+A balance moves for reasons this feed never sees: grants, option exercises and
+tax withholding are filtered out long before, so the closing balance carries
+movements that had nothing to do with the trade. The balance just before the
+first fill does not.
+
+Holdings held through a trust or an entity are marked `(간접)`, since the same
+dollars need not be the filer's own. Where the figure cannot be trusted,
+nothing is shown rather than a guess: the filing omits a holding, its numbers
+contradict each other, or the balances within one named holding do not add up —
+which means either an intervening grant or two holdings sharing a description,
+and there is no way to tell which from the filing alone.
 
 ## Files
 

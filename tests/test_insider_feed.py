@@ -122,7 +122,7 @@ def _congress_row(doc, **kw):
 def _row(**kw):
     base = {"ticker": "AAA", "src": "s1", "owners": ("X",), "title": "", "rank": "",
             "code": "P", "shares": 100.0, "value": 200_000.0, "plan": False,
-            "date": "2025-01-02", "after": None, "direct": True}
+            "date": "2025-01-02", "after": None, "direct": True, "nat": ""}
     base.update(kw)
     return base
 
@@ -204,39 +204,107 @@ class StakeText(unittest.TestCase):
 
 
 class AggregateStake(unittest.TestCase):
+    """합산 거래의 지분 변화율. 숫자는 2026-10-30 제출분 실측값이다."""
+
     def rows(self, *specs):
-        return [dict(_row(code=c, shares=sh, value=sh * 10.0, after=a,
-                          direct=d), date="2025-01-02")
-                for c, sh, a, d in specs]
+        """(거래량, 거래후잔고, 직접여부, 보유형태서술) 목록 -> 원시 행"""
+        return [dict(_row(code=self.CODE, shares=sh, value=sh * 10.0,
+                          after=a, direct=d, nat=n), date="2025-01-02")
+                for sh, a, d, n in specs]
 
-    def test_last_tranche_is_the_final_holding(self):
-        # 보유량은 더하는 값이 아니라 마지막 시점의 잔고다.
-        out = f.aggregate(self.rows(("P", 60_951, 2_389_143, True),
-                                    ("P", 134_662, 2_523_805, True),
-                                    ("P", 54_387, 2_578_192, True)))
-        self.assertEqual(len(out), 1)
+    CODE = "P"
+
+    def test_single_pool_tranches(self):
+        # MSM 실측: 한 풀 안의 3회 체결. 잔고가 거래량만큼 이어진다.
+        out = f.aggregate(self.rows(
+            (60_951, 2_389_143, True, ""),
+            (134_662, 2_523_805, True, ""),
+            (54_387, 2_578_192, True, "")))
         self.assertEqual(out[0]["shares"], 250_000)
-        self.assertEqual(out[0]["after"], 2_578_192)
+        # 분모는 첫 행 직전의 잔고 = 2,389,143 - 60,951
         self.assertEqual(out[0]["before"], 2_328_192)
-
-    def test_ratio_is_computed_on_the_total_not_per_tranche(self):
-        out = f.aggregate(self.rows(("P", 60_951, 2_389_143, True),
-                                    ("P", 134_662, 2_523_805, True),
-                                    ("P", 54_387, 2_578_192, True)))
-        # tranche 별로는 2.6/5.6/2.2% 지만 실제로 움직인 지분은 10.7% 다.
         self.assertAlmostEqual(out[0]["stake"], 0.10738, 4)
 
-    def test_mixed_direct_and_indirect_is_dropped(self):
-        # 직접분과 간접분은 분모가 다른 별개의 보유다. 섞이면 비율이 거짓이 된다.
-        out = f.aggregate(self.rows(("P", 100, 1_100, True),
-                                    ("P", 100, 500, False)))
-        self.assertIsNone(out[0]["after"])
+    def test_several_indirect_pools_are_summed(self):
+        # RAPP 실측: 네 행 모두 간접이지만 서술이 달라 별개 풀이다.
+        # 이전 코드는 마지막 풀 잔고만 써서 분모가 음수가 되어 표기를 버렸다.
+        out = f.aggregate(self.rows(
+            (952_380, 2_815_707, False, "By Sofinnova Venture Partners XI"),
+            (6_395, 17_990, False, "By SummitTX Master, SPC -SummitTX A"),
+            (3_772, 14_924, False, "By SummitTX Master, SPC - SummitTX B"),
+            (6_933, 25_267, False, "By SummitTX Pinnacle Master, L.P.")))
+        self.assertEqual(out[0]["shares"], 969_480)
+        # 1,863,327 + 11,595 + 11,152 + 18,334
+        self.assertEqual(out[0]["before"], 1_904_408)
+        self.assertEqual(f.stake_str(out[0]), "지분 +51% (간접)")
+
+    def test_two_pools_are_not_overstated(self):
+        # BROS 실측 구조: 한 신고자가 두 법인으로 나눠 매도.
+        # 마지막 풀 잔고만 쓰면 분모가 작아져 비율이 뻥튀김한다.
+        self.CODE = "S"
+        rows = self.rows((600, 400, False, "By DM Trust Aggregator, LLC"),
+                         (400, 600, False, "By DM Individual Aggregator, LLC"))
+        out = f.aggregate(rows)
+        # 올바른 분모 = (400+600) + (600+400) = 2,000, 1,000/2,000 = -50%
+        self.assertEqual(out[0]["before"], 2_000)
+        self.assertAlmostEqual(out[0]["stake"], -0.5, 6)
+        # 옛 방식(마지막 잔고 600 + 1,000 = 1,600)이면 -63% 로 과대 표시됐다
+        self.assertNotAlmostEqual(out[0]["stake"], -1_000 / 1_600, 3)
+
+    def test_broken_chain_in_one_pool_is_dropped(self):
+        # MCO·OTLC·MED 실측: 풀 서술이 같은데 잔고가 이어지지 않는다.
+        # 중간에 부여·행사·원천징수가 끼었을 수도, 같은 서술 아래 다른 풀이
+        # 숨었을 수도 있다. 가릴 수 없으니 버린다.
+        out = f.aggregate(self.rows((100, 5_000, True, ""),
+                                    (100, 90_000, True, "")))
         self.assertIsNone(out[0]["stake"])
+        self.assertEqual(f.stake_str(out[0]), "")
+
+    def test_direct_and_indirect_mix_still_computes(self):
+        # 섞여도 풀별로 나누면 분모가 분명하다. 이전에는 통째로 버렸다.
+        out = f.aggregate(self.rows((100, 1_100, True, ""),
+                                    (100, 600, False, "By spouse")))
+        # (1,100-100) + (600-100) = 1,500
+        self.assertEqual(out[0]["before"], 1_500)
+        self.assertAlmostEqual(out[0]["stake"], 200 / 1_500, 6)
+        # 다만 표기상 직접/간접을 한쪽으로 말할 수는 없다
         self.assertIsNone(out[0]["direct"])
+        self.assertEqual(f.stake_str(out[0]), "지분 +13%")
 
     def test_missing_holding_propagates(self):
-        out = f.aggregate(self.rows(("P", 100, None, True)))
+        out = f.aggregate(self.rows((100, None, True, "")))
         self.assertIsNone(out[0]["stake"])
+
+    def test_other_merged_fields_unchanged(self):
+        rows = self.rows((10, 110, True, ""), (20, 130, True, ""))
+        rows[0]["plan"], rows[1]["date"] = True, "2025-01-01"
+        out = f.aggregate(rows)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["shares"], 30)
+        self.assertEqual(out[0]["value"], 300.0)
+        self.assertEqual(out[0]["price"], 10.0)
+        self.assertTrue(out[0]["plan"])
+        self.assertEqual(out[0]["date"], "2025-01-01")
+
+
+class Chains(unittest.TestCase):
+    def rs(self, code, *pairs):
+        return [{"code": code, "shares": sh, "after": a} for sh, a in pairs]
+
+    def test_buy_chain(self):
+        self.assertTrue(f._chains(self.rs("P", (10, 110), (20, 130))))
+
+    def test_sell_chain(self):
+        self.assertTrue(f._chains(self.rs("S", (10, 90), (20, 70))))
+
+    def test_gap_breaks(self):
+        self.assertFalse(f._chains(self.rs("P", (10, 110), (20, 500))))
+
+    def test_single_row_chains(self):
+        self.assertTrue(f._chains(self.rs("P", (10, 110))))
+
+    def test_missing_holding_breaks(self):
+        self.assertFalse(f._chains(self.rs("P", (10, 110), (20, None))))
 
 
 class Cluster(unittest.TestCase):
