@@ -39,6 +39,16 @@ Rule 10b5-1 planned trade, then requires one of:
 Sales are reported under a much higher threshold, since insider selling is a
 weak signal on its own.
 
+The seniority test reads the filer's own stated title, which a few filings a
+day leave as the literal string `See Remarks`. Taken at face value that string
+is a title, so the filer ranked as an officer but not a senior one and failed
+the gate, and the digest printed `See Remarks` where a role belonged. The title
+is now read from the filing's remarks, which is what the string asks the reader
+to do. Remarks is a free-text field rather than a title box, so a sentence
+there still decides seniority but is not printed as a title; a filing that says
+`See Remarks` with nothing in remarks falls back to director or ten-percent
+holder rather than inventing an officer.
+
 Thresholds live at the top of `insider_feed.py`.
 
 ## What a dollar figure does not say
@@ -260,6 +270,22 @@ which turns the Actions run red. The streak is written to state before the
 error is raised, so the count keeps climbing instead of restarting each run.
 
 The two feeds are independent: one failing does not stop the other.
+
+A collection failure is different from a broken parser, and an outage that
+lasts days needs different treatment from one that lasts a run. The Senate's
+WAF refused six scheduled runs in a row; every one of them exited non-zero, so
+the alert stopped carrying information and would have hidden any other fault
+that appeared behind it. Consecutive failures are now counted per chamber. The
+first still exits non-zero, because a single failure may be a real regression.
+From the second, the digest carries one line saying that chamber has gone quiet
+and the run passes; later failures say nothing at all. Recovery is announced
+the same way, once, with the streak it ended. The other chamber's digest goes
+out throughout, and a run carrying only such a notice is still sent — otherwise
+the fact that something went quiet would itself be silent.
+
+Retries are unchanged while a chamber is quiet, so recovery is noticed on the
+next run rather than after a manual nudge. The cost is about three and a half
+minutes of waiting per run on a source that is known to be refusing.
 
 ## Data sources and attribution
 

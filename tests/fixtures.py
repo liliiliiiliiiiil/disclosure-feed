@@ -18,7 +18,7 @@ CIK|Company Name|Form Type|Date Filed|Filename
 
 def form4(ticker="ACME", owners=(("Smith John", "Chief Executive Officer", "0", "0"),),
           txns=(("P", "Common Stock", "1000", "50.00", "2025-01-02"),),
-          aff10b5=None, footnote=None, after=None, direct="D"):
+          aff10b5=None, footnote=None, after=None, direct="D", remarks=None):
     """after 를 주면 postTransactionAmounts 를, direct 는 ownershipNature 를 넣는다.
 
     실제 제출본에는 둘 다 늘 들어 있다(실측 2026-10-27, P/S 29행 전부).
@@ -60,6 +60,7 @@ def form4(ticker="ACME", owners=(("Smith John", "Chief Executive Officer", "0", 
     )
     aff = f"<aff10b5One>{aff10b5}</aff10b5One>" if aff10b5 is not None else ""
     fn = f"<footnotes><footnote>{footnote}</footnote></footnotes>" if footnote else ""
+    rem = f"<remarks>{remarks}</remarks>" if remarks else ""
     return f"""<SEC-DOCUMENT>
 <TEXT>
 <XML>
@@ -73,6 +74,7 @@ def form4(ticker="ACME", owners=(("Smith John", "Chief Executive Officer", "0", 
   <nonDerivativeTable>{rows}
   </nonDerivativeTable>
   {fn}
+  {rem}
 </ownershipDocument>
 </XML>
 </TEXT>

@@ -73,6 +73,12 @@ FORM4_ALERT_MIN_FILINGS = 100
 # 원별로 따로 센다. 합치면 물량 많은 쪽이 고장 난 쪽을 가린다.
 PTR_DRY_DOCS_ALERT = 30
 CHAMBERS = {"house": "하원", "senate": "상원"}
+#
+# 수집 자체가 실패하는 경우는 파서 붕괴와 다르다. 상대 서버의 WAF 차단처럼
+# 며칠씩 이어지는 장애가 있는데, 그동안 매 실행을 실패로 끝내면 경보가
+# 소음이 되고 그 뒤에 생긴 다른 고장을 가린다. 연속 이만큼 실패하면
+# 한 번 알린 뒤 조용히 재시도만 하고, 복구될 때 다시 한 번 알린다.
+PTR_FAIL_QUIET = 2
 
 
 # ---------- HTTP ----------
@@ -203,6 +209,18 @@ def _is_plan_trade(doc):
     return False
 
 
+# officerTitle 자리에 직함 대신 "See Remarks" 만 적어 보내는 신고가 하루
+# 몇 건씩 들어온다. 그대로 두면 두 가지가 동시에 틀어진다: rank 는 직함이
+# 있다는 이유로 OFFICER 에 머물러 상위직 관문을 통과하지 못하고, 메시지에도
+# 그 문자열이 직함으로 찍힌다. 말 그대로 실제 직함은 remarks 에 있으니
+# 거기서 가져온다.
+SEE_REMARKS_RE = re.compile(r"see\s+remarks?\.?$", re.I)
+# remarks 는 직함 칸이 아니라 자유 서술이라 문장이 들어오기도 한다.
+# 등급 판정에는 그대로 쓰되(정규식이므로 문장이어도 안전), 화면 표기는
+# 직함으로 보기 어려운 길이면 버린다.
+TITLE_MAX = 48
+
+
 def _rank(title, is_director, is_ten_pct):
     if title and SENIOR_PAT.search(title):
         return "SENIOR"
@@ -258,6 +276,13 @@ def parse_form4(path):
     if not owners:
         return []
 
+    remarks = (doc.findtext("remarks") or "").strip()
+    owners = [(n, remarks if SEE_REMARKS_RE.match(t) else t) for n, t in owners]
+    # 길이 규칙은 remarks 에서 가져온 직함에만 걸어야 한다. 실제 officerTitle
+    # 에는 "Executive Vice President and Chief Administrative Officer" 처럼
+    # 긴 것이 정상으로 들어온다.
+    shown_remarks = remarks if len(remarks) <= TITLE_MAX else ""
+
     # 직함은 그 직함을 가진 사람에게 붙어야 한다. 공동신고에서 가장 긴 직함만
     # 뽑아 첫 신고자 옆에 찍으면 남의 직책이 오귀속되고, 그 직함으로 rank 까지
     # 올라가 필터를 통과한다. 표시 대상을 직함 주인으로 맞춘다.
@@ -268,6 +293,8 @@ def parse_form4(path):
     title = primary[1]
 
     rank = _rank(title, is_director, is_ten_pct)
+    if title == remarks:
+        title = shown_remarks
     is_plan = _is_plan_trade(doc)   # 문서 단위 체크박스이므로 한 번만 본다
 
     out = []
@@ -502,7 +529,7 @@ def filter_congress(rows):
 # ---------- 중복 발송 방지 ----------
 
 def _dry_map(v):
-    """dry 를 {원: 연속 헛파싱 수} 로 정규화. 상원 추가 전에는 정수였다."""
+    """원별 카운터를 {원: 정수} 로 정규화. 상원 추가 전 dry 는 정수였다."""
     if isinstance(v, int):
         v = {"house": v}
     v = v or {}
@@ -510,7 +537,8 @@ def _dry_map(v):
 
 
 def load_state():
-    """(발송 완료 거래, 처리 완료 PTR 문서, 원별 연속 헛파싱 수, 티커별 SIC).
+    """(발송 완료 거래, 처리 완료 PTR 문서, 원별 연속 헛파싱 수,
+    티커별 SIC, 원별 연속 수집 실패 수).
 
     구버전은 평면 키 목록이었으므로 그 형태도 읽는다.
     """
@@ -518,16 +546,17 @@ def load_state():
         with open(STATE_PATH) as f:
             data = json.load(f)
     except (OSError, ValueError):
-        return set(), set(), _dry_map(None), {}
+        return set(), set(), _dry_map(None), {}, _dry_map(None)
     if isinstance(data, list):
-        return set(data), set(), _dry_map(None), {}
+        return set(data), set(), _dry_map(None), {}, _dry_map(None)
     return (set(data.get("keys", ())),
             set(data.get("docs", ())),
             _dry_map(data.get("dry")),
-            dict(data.get("sic") or {}))
+            dict(data.get("sic") or {}),
+            _dry_map(data.get("fails")))
 
 
-def save_state(keys, docs, dry, sic=None):
+def save_state(keys, docs, dry, sic=None, fails=None):
     d = os.path.dirname(STATE_PATH)
     if d:
         os.makedirs(d, exist_ok=True)
@@ -536,7 +565,8 @@ def save_state(keys, docs, dry, sic=None):
                    "docs": sorted(docs)[-50_000:],
                    "dry": _dry_map(dry),
                    # 티커의 SIC 는 바뀌지 않으므로 한 번 찾으면 계속 쓴다.
-                   "sic": dict(sorted((sic or {}).items()))}, f)
+                   "sic": dict(sorted((sic or {}).items())),
+                   "fails": _dry_map(fails)}, f)
 
 
 def dry_streak(prev, parsed, found):
@@ -678,13 +708,14 @@ def build_insider_message(buys, sells, date, total, filings, failed, broken):
     return [(ln, None) for ln in lines]
 
 
-def build_congress_message(rows, scanned, since, broken=None):
+def build_congress_message(rows, scanned, since, broken=None, notices=()):
     """(줄, 키) 목록. 각 거래 줄에는 그 거래의 상태 키를 붙인다.
 
     TOP_N 으로 잘라내지 않는다. 잘린 분까지 발송 완료로 기록되어 영영
     사라지던 문제 때문이며, 분량은 paginate 가 메시지 분할로 처리한다.
 
     broken 은 {원: 연속 헛파싱 수}. 비어 있지 않으면 경보를 머리에 붙인다.
+    notices 는 수집 상태가 바뀐 순간에만 들어오는 한 줄 공지들이다.
     """
     def group(kind):
         return sorted([r for r in rows if r["type"] == kind], key=lambda r: -r["value"])
@@ -698,6 +729,8 @@ def build_congress_message(rows, scanned, since, broken=None):
     for n, v in sorted((broken or {}).items()):
         items.append(
             (f"<i>⚠️ {CHAMBERS[n]} PTR {v}건 연속 거래 0건 — 파서 점검 필요</i>", None))
+    for line in notices:
+        items.append((f"<i>{esc(line)}</i>", None))
     items.append(("", None))
     # 교환(E)은 드물어 항상 비어 있는 칸을 만들 필요가 없다. 다만 예전처럼
     # 조용히 버리면 상태에는 기록되고 화면에는 없는 건이 생긴다.
@@ -798,24 +831,38 @@ COLLECTORS = (("house", house_ptr.collect_house),
 
 def run_congress():
     since = dt.date.today() - dt.timedelta(days=CONGRESS_LOOKBACK_DAYS)
-    seen, done_docs, dry, sic = load_state()
+    seen, done_docs, dry, sic, fails = load_state()
 
     rows, scanned, fetched, failed = [], [], set(), []
+    notices = []
     for name, collect in COLLECTORS:
         # 두 원은 소스가 완전히 다르다(Clerk ZIP+PDF vs EFD 검색+HTML).
         # 한쪽 서식이 바뀌어도 다른 쪽 공시는 계속 보낸다.
         try:
             r, sc, fe = collect(since, skip_docs=done_docs)
         except Exception as e:
+            fails[name] += 1
             failed.append(name)
-            print(f"[error] {CHAMBERS[name]} PTR 수집 실패: {e!r}", file=sys.stderr)
+            print(f"[error] {CHAMBERS[name]} PTR 수집 실패 "
+                  f"({fails[name]}회 연속): {e!r}", file=sys.stderr)
+            if fails[name] == PTR_FAIL_QUIET:
+                notices.append(
+                    f"⚠️ {CHAMBERS[name]} PTR {fails[name]}회 연속 수집 실패 — "
+                    f"복구될 때까지 조용히 재시도합니다")
             continue
+        if fails[name] >= PTR_FAIL_QUIET:
+            notices.append(
+                f"✅ {CHAMBERS[name]} PTR 수집 복구 ({fails[name]}회 연속 실패 후)")
+        fails[name] = 0
         dry[name] = dry_streak(dry[name], len(fe) - len(sc), len(r))
         rows += r
         scanned += sc
         fetched |= fe
 
     broken = {n: v for n, v in dry.items() if v >= PTR_DRY_DOCS_ALERT}
+    # 이미 알린 장애로 매 실행을 빨갛게 만들지 않는다. 첫 실패는 그대로
+    # 시끄럽게 두고, 이어지는 실패는 공지 한 줄로 끝낸다.
+    loud = [n for n in failed if fails[n] < PTR_FAIL_QUIET]
 
     eligible = filter_congress(rows)
     fresh = [r for r in eligible if r["key"] not in seen]
@@ -823,13 +870,14 @@ def run_congress():
     annotate_overlap(fresh, sic)
 
     sent = set()
-    if fresh or scanned or broken:
-        msgs, sent = paginate(build_congress_message(fresh, scanned, since, broken))
+    if fresh or scanned or broken or notices:
+        msgs, sent = paginate(
+            build_congress_message(fresh, scanned, since, broken, notices))
         for m in msgs:
             send(m)
     seen |= sent
     print(f"congress fetched={len(fetched)} new={len(fresh)} "
-          f"scanned={len(scanned)} sent={len(sent)} dry={dry} "
+          f"scanned={len(scanned)} sent={len(sent)} dry={dry} fails={fails} "
           f"overlap={sum(1 for r in fresh if r.get('overlap'))}")
 
     # 발송이 끝난 문서만 완료 처리한다. 페이지 상한에 걸려 남은 행이 있는
@@ -838,14 +886,14 @@ def run_congress():
     pending |= {f["doc_id"] for f in scanned if f["doc_id"] not in sent}
     # 카운터는 예외보다 먼저 저장한다. 저장 전에 죽으면 다음 실행이 같은
     # 자리에서 다시 세기 시작해 경보가 영영 오지 않는다.
-    save_state(seen, done_docs | (fetched - pending), dry, sic)
+    save_state(seen, done_docs | (fetched - pending), dry, sic, fails)
 
     if broken:
         raise RuntimeError("PTR 연속 파싱 0건 — " + ", ".join(
             f"{CHAMBERS[n]} {v}건" for n, v in sorted(broken.items())))
-    if failed:
+    if loud:
         raise RuntimeError(
-            "PTR 수집 실패: " + ", ".join(CHAMBERS[n] for n in failed))
+            "PTR 수집 실패: " + ", ".join(CHAMBERS[n] for n in loud))
 
 
 def main():

@@ -97,6 +97,63 @@ class ParseForm4(unittest.TestCase):
         self.assertEqual(r["title"], "Chief Financial Officer")
         self.assertEqual(r["rank"], "SENIOR")
 
+    def test_see_remarks_title_is_resolved_from_remarks(self):
+        # 실측 하루 7건 꼴. 직함 자리에 "See Remarks" 만 들어와 상위직
+        # 관문을 통과하지 못하고 있었다.
+        r = self.parse(form4(
+            owners=(("Smith John", "See Remarks", "0", "0"),),
+            remarks="Chief Executive Officer"))[0]
+        self.assertEqual(r["title"], "Chief Executive Officer")
+        self.assertEqual(r["rank"], "SENIOR")
+
+    def test_see_remarks_wins_primary_in_a_joint_filing(self):
+        r = self.parse(form4(owners=(
+            ("Acme Holdings LLC", "", "0", "1"),
+            ("Doe Jane", "See Remarks", "0", "0"),
+        ), remarks="Chief Financial Officer"))[0]
+        self.assertEqual(r["owners"][0], "Doe Jane")
+        self.assertEqual(r["rank"], "SENIOR")
+
+    def test_see_remarks_sentence_sets_rank_but_is_not_displayed(self):
+        # remarks 는 직함 칸이 아니라 자유 서술이다. 등급은 올라가야 하지만
+        # 문장이 직함 자리에 찍히면 안 된다.
+        r = self.parse(form4(
+            owners=(("Smith John", "See Remarks", "0", "0"),),
+            remarks="The reporting person serves as the Chief Executive "
+                    "Officer of the Issuer."))[0]
+        self.assertEqual(r["rank"], "SENIOR")
+        self.assertEqual(r["title"], "")
+
+    def test_see_remarks_without_remarks_does_not_fake_a_title(self):
+        # 이전에는 "See Remarks" 가 직함으로 남아 OFFICER 를 만들어냈다.
+        r = self.parse(form4(
+            owners=(("Smith John", "See Remarks", "1", "0"),), remarks=None))[0]
+        self.assertEqual(r["title"], "Director")
+        self.assertEqual(r["rank"], "DIRECTOR")
+
+    def test_a_long_real_title_is_not_truncated(self):
+        # 길이 규칙은 remarks 에서 온 직함에만 걸린다. 실제 직함에는
+        # 이만큼 긴 것이 정상으로 들어온다.
+        long = "Executive Vice President and Chief Administrative Officer"
+        self.assertGreater(len(long), f.TITLE_MAX)
+        r = self.parse(form4(owners=(("Smith John", long, "0", "0"),)))[0]
+        self.assertEqual(r["title"], long)
+
+    def test_a_real_title_ignores_remarks(self):
+        r = self.parse(form4(
+            owners=(("Smith John", "Chief Executive Officer", "0", "0"),),
+            remarks="Shares sold to cover taxes."))[0]
+        self.assertEqual(r["title"], "Chief Executive Officer")
+
+    def test_see_remarks_inside_a_longer_title_is_left_alone(self):
+        # "Officer - See Remarks" 는 직함 정보를 이미 담고 있다. 통째로
+        # 갈아치우면 그쪽을 잃는다.
+        r = self.parse(form4(
+            owners=(("Smith John", "VP - See Remarks", "0", "0"),),
+            remarks="Chief Executive Officer"))[0]
+        self.assertEqual(r["title"], "VP - See Remarks")
+        self.assertEqual(r["rank"], "OFFICER")
+
     def test_fetch_failure_returns_none(self):
         import requests
 
@@ -426,21 +483,25 @@ class State(unittest.TestCase):
         f.STATE_PATH = self.orig
 
     def test_round_trip(self):
-        f.save_state({"k1", "k2"}, {"d1"}, {"house": 7, "senate": 3}, {"AAPL": "3571"})
+        f.save_state({"k1", "k2"}, {"d1"}, {"house": 7, "senate": 3},
+                     {"AAPL": "3571"}, {"house": 0, "senate": 4})
         self.assertEqual(f.load_state(),
                          ({"k1", "k2"}, {"d1"}, {"house": 7, "senate": 3},
-                          {"AAPL": "3571"}))
+                          {"AAPL": "3571"}, {"house": 0, "senate": 4}))
 
     def test_reads_legacy_flat_list(self):
         with open(f.STATE_PATH, "w") as fh:
             json.dump(["k1", "k2"], fh)
         self.assertEqual(f.load_state(),
-                         ({"k1", "k2"}, set(), {"house": 0, "senate": 0}, {}))
+                         ({"k1", "k2"}, set(), {"house": 0, "senate": 0}, {},
+                          {"house": 0, "senate": 0}))
 
     def test_reads_state_written_before_the_counter_existed(self):
         with open(f.STATE_PATH, "w") as fh:
             json.dump({"keys": ["k1"], "docs": ["d1"]}, fh)
-        self.assertEqual(f.load_state(), ({"k1"}, {"d1"}, {"house": 0, "senate": 0}, {}))
+        self.assertEqual(f.load_state(),
+                         ({"k1"}, {"d1"}, {"house": 0, "senate": 0}, {},
+                          {"house": 0, "senate": 0}))
 
     def test_reads_counter_from_before_the_senate_was_added(self):
         # 당시 dry 는 하원 하나뿐이라 정수였다.
@@ -450,7 +511,9 @@ class State(unittest.TestCase):
 
     def test_missing_file(self):
         f.STATE_PATH = os.path.join(self.tmp, "nope", "seen.json")
-        self.assertEqual(f.load_state(), (set(), set(), {"house": 0, "senate": 0}, {}))
+        self.assertEqual(f.load_state(),
+                         (set(), set(), {"house": 0, "senate": 0}, {},
+                          {"house": 0, "senate": 0}))
 
 
 class DryStreak(unittest.TestCase):
@@ -545,6 +608,68 @@ class CongressAlert(unittest.TestCase):
         # 하원 공시는 그래도 나갔어야 한다.
         self.assertEqual(len(self.sent), 1)
         self.assertIn("AAPL", self.sent[0])
+
+    def test_repeated_failure_goes_quiet_after_announcing_once(self):
+        def senate(since, skip_docs=()):
+            raise RuntimeError("403")
+
+        # 1회: 그대로 시끄럽게. 일시적 장애일 수 있다.
+        self.feed({"h1"}, rows=[_congress_row("h1")], senate=senate)
+        with self.assertRaises(RuntimeError):
+            f.run_congress()
+        self.assertEqual(f.load_state()[4]["senate"], 1)
+        self.assertNotIn("조용히", self.sent[-1])
+
+        # 2회: 한 번 알리고 런은 통과시킨다.
+        self.feed({"h2"}, rows=[_congress_row("h2")], senate=senate)
+        f.run_congress()
+        self.assertEqual(f.load_state()[4]["senate"], 2)
+        self.assertIn("상원", self.sent[-1])
+        self.assertIn("조용히", self.sent[-1])
+
+        # 3회 이후: 공지도 없고 런도 통과한다.
+        self.feed({"h3"}, rows=[_congress_row("h3")], senate=senate)
+        f.run_congress()
+        self.assertEqual(f.load_state()[4]["senate"], 3)
+        self.assertNotIn("조용히", self.sent[-1])
+        self.assertNotIn("수집 복구", self.sent[-1])
+
+    def test_recovery_is_announced_once_and_resets(self):
+        f.save_state(set(), set(), None, None, {"senate": 6})
+        self.feed({"h1"}, rows=[_congress_row("h1")])
+        f.run_congress()
+        self.assertIn("상원 PTR 수집 복구 (6회 연속 실패 후)", self.sent[-1])
+        self.assertEqual(f.load_state()[4]["senate"], 0)
+
+        self.feed({"h2"}, rows=[_congress_row("h2")])
+        f.run_congress()
+        self.assertNotIn("복구", self.sent[-1])
+
+    def test_quiet_failure_still_sends_when_there_is_nothing_else(self):
+        # 공지만 있는 실행도 나가야 한다. 안 나가면 조용해진 사실조차 모른다.
+        def senate(since, skip_docs=()):
+            raise RuntimeError("403")
+        f.save_state(set(), set(), None, None, {"senate": 1})
+        self.feed(senate=senate)
+        f.run_congress()
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("조용히", self.sent[0])
+
+    def test_the_other_chamber_failing_does_not_silence_this_one(self):
+        def senate(since, skip_docs=()):
+            raise RuntimeError("403")
+        # 상원은 이미 조용해진 상태, 하원은 지금 처음 실패한다.
+        f.save_state(set(), set(), None, None, {"senate": 5})
+
+        def house(since, skip_docs=()):
+            raise RuntimeError("Clerk ZIP 404")
+        f.COLLECTORS = (("house", house), ("senate", senate))
+        with self.assertRaises(RuntimeError) as cm:
+            f.run_congress()
+        self.assertIn("하원", str(cm.exception))
+        self.assertNotIn("상원", str(cm.exception))
+        state = f.load_state()[4]
+        self.assertEqual((state["house"], state["senate"]), (1, 6))
 
     def test_overlap_failure_does_not_stop_the_digest(self):
         # 교차참조는 본문이 아니라 주석이다. 소스가 죽어도 공시는 가야 한다.
