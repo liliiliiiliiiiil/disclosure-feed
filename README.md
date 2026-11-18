@@ -14,12 +14,11 @@ message, one set of thresholds and one deduplication state. Only the collection
 differs: the House publishes a yearly ZIP of PDFs, the Senate a search behind a
 click-through agreement.
 
-Runs on GitHub Actions Tuesday through Saturday. The cron asks for 05:30 UTC,
-but GitHub's scheduler has consistently fired it about four hours late, so the
-messages actually arrive between 09:30 and 10:15 UTC. That only shifts when the
-digest lands, not what is in it: the target date comes from the calendar day
-rather than the clock. No third-party data vendors — both sources are official
-government endpoints.
+Runs on GitHub Actions, started by hand (**Actions -> insider-feed -> Run
+workflow**). The scheduled trigger was removed because GitHub's scheduler
+consistently fired it about four hours late. Each run reads Form 4 for the
+business day before the run date only, so a day with no run is not backfilled.
+No third-party data vendors — both sources are official government endpoints.
 
 ## Why filtering matters
 
@@ -96,7 +95,7 @@ and there is no way to tell which from the filing alone.
 ## Files
 
 ```
-.github/workflows/insider_feed.yml   Schedule and secrets
+.github/workflows/insider_feed.yml   Manual trigger and secrets
 .github/workflows/tests.yml          Parser regression tests on every push
 insider_feed.py                      Entry point, Form 4 collection, Telegram
 house_ptr.py                         House PTR collection (imported module)
